@@ -1,0 +1,8 @@
+# build output
+peanutbutty
+*.o
+
+# local relics / snapshots
+peanutbutty-og.c
+glterm_app
+gltermworking-1
