@@ -1,0 +1,38 @@
+# PeanutBuTTY configuration — copy to ~/.config/peanutbutty.conf
+# All values shown are the built-in defaults.
+
+# Font family (fontconfig name) and pixel size
+font = monospace
+size = 12
+
+# Inner padding between the window edge and the cell grid, in pixels
+padding = 8
+
+# Scrollback lines kept per session
+scrollback = 5000
+
+# Cursor blink period in milliseconds (100-5000)
+blink = 530
+
+# Colours, hex RRGGBB (leading # optional)
+foreground = c5c8c6
+background = 000000
+cursor     = aeafad
+
+# 16-colour ANSI palette overrides (color0 .. color15)
+#color0 = 000000
+#color1 = cc6666
+#color2 = b5bd68
+#color3 = de935f
+#color4 = 81a2be
+#color5 = b294bb
+#color6 = 8abeb7
+#color7 = c5c8c6
+#color8 = 969896
+#color9 = cc6666
+#color10 = b5bd68
+#color11 = f0c674
+#color12 = 81a2be
+#color13 = b294bb
+#color14 = 8abeb7
+#color15 = ffffff
