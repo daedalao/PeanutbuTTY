@@ -15,9 +15,13 @@ LIBS       = $(shell pkg-config --libs freetype2 fontconfig x11 gl) -lm -lutil
 # Arch detection
 ARCH := $(shell uname -m)
 
-# PowerPC 32-bit (G4 / 74xx) optimization flags
+# Per-arch optimization flags (used by the `ppc32` / `ppc64le` targets)
 ifneq (,$(filter $(ARCH),ppc powerpc ppc64))
+    # PowerPC 32-bit (G4 / 74xx)
     PPC_OPT = -mcpu=7450 -mtune=7450 -maltivec -mabi=altivec -ffast-math -fexpensive-optimizations
+else ifeq ($(ARCH),ppc64le)
+    # POWER8+ little-endian
+    PPC_OPT = -O3 -mcpu=power8 -mtune=power8 -maltivec -mvsx
 else
     PPC_OPT = -O3
 endif
@@ -25,7 +29,7 @@ endif
 SRC     = peanutbutty.c
 OBJ     = $(SRC:.c=.o)
 
-.PHONY: all clean install native ppc32 icon
+.PHONY: all clean install native ppc32 ppc64le icon
 
 all: $(TARGET)
 
@@ -39,6 +43,9 @@ native:
 	$(MAKE) OPT="-O3"
 
 ppc32:
+	$(MAKE) OPT="$(PPC_OPT)"
+
+ppc64le:
 	$(MAKE) OPT="$(PPC_OPT)"
 
 clean:
