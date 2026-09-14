@@ -37,6 +37,7 @@
 
 #include <GL/gl.h>
 #include <GL/glx.h>
+#include "icon_data.h"
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -318,8 +319,9 @@ struct {
 /* --- Shaders --- */
 static const char *VERT_SRC = "#version 110\nattribute vec2 a_pos; attribute vec2 a_uv; attribute vec4 a_color;\nuniform mat4 u_proj; varying vec2 v_uv; varying vec4 v_color;\nvoid main() {\ngl_Position = u_proj * vec4(a_pos, 0.0, 1.0); v_uv = a_uv; v_color = a_color;\n}\n";
 /* Color packing: R300 GPU reads vertex attribute bytes in memory order as RGBA.
- * On big-endian PPC, uint32_t (r<<24|g<<16|b<<8|a) lays out bytes [r,g,b,a]
- * in memory — exactly what the GPU sees. DO NOT change this byte order; the GPU
+ * rgba_bytes() builds a uint32_t whose memory layout is [r,g,b,a] on either
+ * endianness (big-endian G4: r<<24; little-endian POWER8/x86: r in low byte).
+ * That is exactly what the GPU sees. DO NOT change the byte order; the GPU
  * is little-endian but reads 4-byte attributes as individual bytes, so no
  * 32-bit word swap occurs for GL_UNSIGNED_BYTE vertex attributes.
  * Scanline and vignette effects removed: too costly on R300 fill rate.
@@ -358,6 +360,17 @@ static void bell(void) {
     if (!G.focused) set_urgency(1);
 }
 
+/* Produce a uint32 whose *memory* byte order is [r,g,b,a] regardless of host
+ * endianness. GL_UNSIGNED_BYTE attributes/textures are read byte-by-byte, so
+ * the big-endian G4 and little-endian POWER8/x86 need different shifts. */
+static inline uint32_t rgba_bytes(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;
+#else
+    return ((uint32_t)r << 24) | ((uint32_t)g << 16) | ((uint32_t)b << 8) | a;
+#endif
+}
+
 static inline uint32_t pack_color(uint32_t c, uint8_t a) {
     uint8_t r = (c >> 16) & 0xFF;
     uint8_t g = (c >> 8) & 0xFF;
@@ -367,7 +380,7 @@ static inline uint32_t pack_color(uint32_t c, uint8_t a) {
         g = (uint8_t)((uint32_t)g * a / 255);
         b = (uint8_t)((uint32_t)b * a / 255);
     }
-    return ((uint32_t)r << 24) | ((uint32_t)g << 16) | ((uint32_t)b << 8) | a;
+    return rgba_bytes(r, g, b, a);
 }
 
 /* Face that can actually draw cp in the requested style (0 reg, 1 bold,
@@ -1196,7 +1209,7 @@ static void term_handle_sixel(Terminal *t, uint8_t b) {
             for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
                 uint8_t pi = sc->pix[y * sc->w + x];
                 /* index 0 = never painted = transparent; stored palette index is +1 */
-                if (pi) rgba[y * w + x] = (sc->pal[pi - 1] << 8) | 0xFF;
+                if (pi) { uint32_t p = sc->pal[pi - 1]; rgba[y * w + x] = rgba_bytes((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF, 0xFF); }
             }
             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
@@ -2129,6 +2142,23 @@ int main(int argc, char **argv) {
     XStoreName(G.dpy, G.win, "PeanutBuTTY");
     XClassHint ch = { (char*)"peanutbutty", (char*)"PeanutBuTTY" };
     XSetClassHint(G.dpy, G.win, &ch);
+    { /* window icon: _NET_WM_ICON is a CARDINAL/32 array of {w, h, ARGB...} per size */
+        size_t n = 0;
+        for (int i = 0; i < ICON_LEVEL_COUNT; i++) n += 2 + (size_t)ICON_LEVELS[i].size * ICON_LEVELS[i].size;
+        unsigned long *buf = malloc(n * sizeof(*buf));
+        if (buf) {
+            size_t k = 0;
+            for (int i = 0; i < ICON_LEVEL_COUNT; i++) {
+                int sz = ICON_LEVELS[i].size; const uint8_t *p = ICON_LEVELS[i].argb;
+                buf[k++] = (unsigned long)sz; buf[k++] = (unsigned long)sz;
+                for (int j = 0; j < sz * sz; j++, p += 4)
+                    buf[k++] = ((unsigned long)p[0] << 24) | ((unsigned long)p[1] << 16) | ((unsigned long)p[2] << 8) | p[3];
+            }
+            XChangeProperty(G.dpy, G.win, XInternAtom(G.dpy, "_NET_WM_ICON", False), XA_CARDINAL, 32,
+                            PropModeReplace, (unsigned char*)buf, (int)n);
+            free(buf);
+        }
+    }
     Atom wm_delete = XInternAtom(G.dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(G.dpy, G.win, &wm_delete, 1);
     signal(SIGPIPE, SIG_IGN); /* don't die writing to the pty after the shell exits */

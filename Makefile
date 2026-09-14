@@ -25,14 +25,14 @@ endif
 SRC     = peanutbutty.c
 OBJ     = $(SRC:.c=.o)
 
-.PHONY: all clean install native ppc32
+.PHONY: all clean install native ppc32 icon
 
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) $(OPT) -o $@ $^ $(LIBS)
 
-%.o: %.c
+%.o: %.c icon_data.h
 	$(CC) $(CFLAGS) $(OPT) $(PKG_CFLAGS) -c -o $@ $<
 
 native:
@@ -46,3 +46,7 @@ clean:
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) $(DESTDIR)/usr/local/bin/$(TARGET)
+
+# Regenerate the embedded window icon from peanutbuttyicon.jpg (needs python3 + Pillow)
+icon:
+	python3 gen_icon.py
