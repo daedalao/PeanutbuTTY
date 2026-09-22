@@ -1454,6 +1454,19 @@ static void term_process(Terminal *t, const uint8_t *buf, int len) {
 /* Line shown at screen row r, accounting for scrollback offset (Shift+PgUp).
  * Scrollback lines can be narrower than the current grid after a resize —
  * callers must guard column accesses with `c < line->cols`. */
+/* Is cell (r,c) of the visible grid inside the active mouse selection? */
+static int cell_selected(Terminal *t, int r, int c) {
+    if (!t->sel_active) return 0;
+    int y1 = fmin(t->sel_y1, t->sel_y2), y2 = fmax(t->sel_y1, t->sel_y2);
+    int x1 = (t->sel_y1 < t->sel_y2) ? t->sel_x1 : ((t->sel_y1 > t->sel_y2) ? t->sel_x2 : fmin(t->sel_x1, t->sel_x2));
+    int x2 = (t->sel_y1 < t->sel_y2) ? t->sel_x2 : ((t->sel_y1 > t->sel_y2) ? t->sel_x1 : fmax(t->sel_x1, t->sel_x2));
+    if (r > y1 && r < y2) return 1;
+    if (r == y1 && r == y2) return c >= x1 && c <= x2;
+    if (r == y1) return c >= x1;
+    if (r == y2) return c <= x2;
+    return 0;
+}
+
 static Line *visible_line(Terminal *t, int r) {
     if (t->alt_active || t->sb_offset <= 0) return (t->alt_active ? t->alt_screen : t->screen) + r;
     int sb_r = t->sb.count - t->sb_offset + r;
@@ -1579,18 +1592,10 @@ static void render_frame(void) {
         for (int c=0; c<t->cols; c++) {
             Cell *bcell = (c < ln->cols) ? &ln->cells[c] : NULL;
             uint32_t current_bg = bcell ? bcell->bg : COLOR_BG;
-            int in_sel = 0;
             int in_match = have_search && c < 1024 && sflags[c];
-            if (t->sel_active) {
-                int y1 = fmin(t->sel_y1, t->sel_y2), y2 = fmax(t->sel_y1, t->sel_y2);
-                int x1 = (t->sel_y1 < t->sel_y2) ? t->sel_x1 : ((t->sel_y1 > t->sel_y2) ? t->sel_x2 : fmin(t->sel_x1, t->sel_x2));
-                int x2 = (t->sel_y1 < t->sel_y2) ? t->sel_x2 : ((t->sel_y1 > t->sel_y2) ? t->sel_x1 : fmax(t->sel_x1, t->sel_x2));
-                if (r > y1 && r < y2) in_sel = 1;
-                else if (r == y1 && r == y2) in_sel = (c >= x1 && c <= x2);
-                else if (r == y1) in_sel = (c >= x1);
-                else if (r == y2) in_sel = (c <= x2);
-            }
-            if (bcell && ((bcell->attrs & ATTR_REVERSE) || in_sel || in_match)) current_bg = bcell->fg;
+            /* Selection/search invert the cell's displayed colours; combined with
+             * ATTR_REVERSE the two inversions cancel so the cell stays visible. */
+            if (bcell && (((bcell->attrs & ATTR_REVERSE) != 0) ^ (cell_selected(t, r, c) || in_match))) current_bg = bcell->fg;
             if (current_bg != last_bg) {
                 if (start_c != -1) draw_rect_hw(vbo_ptr, (float)(start_c*G_hw.font_w), py, (float)((c-start_c)*G_hw.font_w), (float)G_hw.font_h, pack_color(last_bg, 255), &v_idx);
                 start_c = (current_bg != COLOR_BG) ? c : -1; last_bg = current_bg;
@@ -1614,11 +1619,14 @@ static void render_frame(void) {
             if (cell->codepoint <= 32 || cell->codepoint == CP_WIDE_CONTINUATION) continue;
             if (cell->attrs & ATTR_INVIS) continue;
             if ((cell->attrs & ATTR_BLINK) && !G.cursor_phase) continue;
-            /* ATTR_REVERSE swaps fg/bg: text drawn in bg color over fg-colored background */
-            uint32_t draw_fg = (cell->attrs & ATTR_REVERSE) ? cell->bg : cell->fg;
-            if (have_search && c < 1024 && sflags[c]) draw_fg = cell->bg; /* inverted over match highlight */
+            /* ATTR_REVERSE, selection and search matches swap fg/bg: text drawn in bg
+             * color over fg-colored background. Must mirror the background pass above,
+             * otherwise text is painted fg-on-fg and disappears (was the case for
+             * selections until 2026-09-22). */
+            int inverted = ((cell->attrs & ATTR_REVERSE) != 0) ^ (cell_selected(t, r, c) || (have_search && c < 1024 && sflags[c]));
+            uint32_t draw_fg = inverted ? cell->bg : cell->fg;
             /* Bold → bright: map palette[0-7] to palette[8-15] for basic ANSI colors */
-            if ((cell->attrs & ATTR_BOLD) && !(cell->attrs & ATTR_REVERSE)) {
+            if ((cell->attrs & ATTR_BOLD) && !inverted) {
                 for (int _pi = 0; _pi < 8; _pi++) {
                     if (draw_fg == PALETTE[_pi]) { draw_fg = PALETTE[_pi + 8]; break; }
                 }
