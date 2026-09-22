@@ -3,6 +3,7 @@
 
 CC      ?= gcc
 TARGET  ?= peanutbutty
+PREFIX  ?= /usr/local
 
 # Core flags
 CFLAGS  = -std=c99 -O3 -Wall -Wextra -Wno-unused-parameter
@@ -34,7 +35,7 @@ OBJ     = $(SRC:.c=.o)
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
-	$(CC) $(CFLAGS) $(OPT) -o $@ $^ $(LIBS)
+	$(CC) $(CFLAGS) $(OPT) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 %.o: %.c icon_data.h
 	$(CC) $(CFLAGS) $(OPT) $(PKG_CFLAGS) -c -o $@ $<
@@ -52,8 +53,12 @@ clean:
 	rm -f $(OBJ) $(TARGET)
 
 install: $(TARGET)
-	install -Dm755 $(TARGET) $(DESTDIR)/usr/local/bin/$(TARGET)
+	install -Dm755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	install -Dm644 peanutbutty.desktop $(DESTDIR)$(PREFIX)/share/applications/peanutbutty.desktop
+	install -Dm644 peanutbutty.png $(DESTDIR)$(PREFIX)/share/icons/hicolor/256x256/apps/peanutbutty.png
+	install -Dm644 peanutbutty.conf.example $(DESTDIR)$(PREFIX)/share/doc/peanutbutty/peanutbutty.conf.example
+	install -Dm644 README.md $(DESTDIR)$(PREFIX)/share/doc/peanutbutty/README.md
 
-# Regenerate the embedded window icon from peanutbuttyicon.jpg (needs python3 + Pillow)
+# Regenerate the embedded window icon + peanutbutty.png from peanutbuttyicon.jpg (needs python3 + Pillow)
 icon:
 	python3 gen_icon.py

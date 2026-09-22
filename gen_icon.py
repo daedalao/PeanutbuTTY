@@ -21,4 +21,5 @@ for s in SIZES:
 out.append("static const IconLevel ICON_LEVELS[] = { " + ", ".join(f"{{{s}, icon_{s}}}" for s in SIZES) + " };")
 out.append("#define ICON_LEVEL_COUNT " + str(len(SIZES)))
 open("icon_data.h", "w").write("\n".join(out) + "\n")
-print("wrote icon_data.h")
+src.resize((256, 256), Image.LANCZOS).save("peanutbutty.png", optimize=True)
+print("wrote icon_data.h and peanutbutty.png")

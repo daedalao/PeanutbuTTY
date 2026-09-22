@@ -1780,7 +1780,20 @@ static void font_set_metrics(int sz) {
     if (G_hw.font_as <= 0) G_hw.font_as = (G_hw.font_h * 8) / 10;
 }
 
-/* Runtime font size change (Ctrl+Shift+Plus/Minus/0): rebuild atlas + grid */
+/* Tell the WM our cell geometry so interactive resizes snap to it.
+ * Called at startup and again whenever the cell size or padding changes. */
+static void wm_set_size_hints(void) {
+    XSizeHints *sh = XAllocSizeHints();
+    if (!sh) return;
+    sh->flags = PResizeInc | PBaseSize | PMinSize;
+    sh->width_inc = G_hw.font_w; sh->height_inc = G_hw.font_h;
+    sh->base_width = sh->base_height = 2*CFG.padding;
+    sh->min_width = 2*CFG.padding + 20*G_hw.font_w; sh->min_height = 2*CFG.padding + 4*G_hw.font_h;
+    XSetWMNormalHints(G.dpy, G.win, sh);
+    XFree(sh);
+}
+
+/* Runtime font size change (Ctrl+Plus/Minus/0, Ctrl+wheel): rebuild atlas + grid */
 static void font_resize(int newsz) {
     if (newsz < 6) newsz = 6;
     if (newsz > 48) newsz = 48;
@@ -1797,6 +1810,7 @@ static void font_resize(int newsz) {
     if (cols < 2) cols = 2;
     if (rows < 1) rows = 1;
     term_resize(G.term, cols, rows);
+    wm_set_size_hints();
 }
 
 /* Live config reload (SIGUSR1 or the config file changing on disk).
@@ -1837,6 +1851,7 @@ static void config_reapply(void) {
         if (cols < 2) cols = 2;
         if (rows < 1) rows = 1;
         term_resize(G.term, cols, rows);
+        wm_set_size_hints();
     }
     G.term->full_dirty = 1;
 }
@@ -2202,14 +2217,7 @@ int main(int argc, char **argv) {
     if (cols < 40) { cols = 40; }
     if (rows < 10) { rows = 10; }
 
-    /* Tell the WM our cell geometry so interactive resizes snap to it */
-    XSizeHints *sh = XAllocSizeHints();
-    sh->flags = PResizeInc | PBaseSize | PMinSize;
-    sh->width_inc = G_hw.font_w; sh->height_inc = G_hw.font_h;
-    sh->base_width = sh->base_height = 2*CFG.padding;
-    sh->min_width = 2*CFG.padding + 20*G_hw.font_w; sh->min_height = 2*CFG.padding + 4*G_hw.font_h;
-    XSetWMNormalHints(G.dpy, G.win, sh);
-    XFree(sh);
+    wm_set_size_hints();
 
     glViewport(0, 0, G.win_w, G.win_h);
 
@@ -2327,6 +2335,11 @@ int main(int argc, char **argv) {
                 int report = G.term->mouse_mode && !(ev.xbutton.state & ShiftMask);
                 if (ev.xbutton.button == 4 || ev.xbutton.button == 5) {
                     int up = (ev.xbutton.button == 4);
+                    if (ev.xbutton.state & ControlMask) { /* Ctrl+wheel zooms the font */
+                        font_resize(G_hw.font_sz + (up ? 1 : -1));
+                        render = 1;
+                        continue;
+                    }
                     if (report) mouse_report(up ? 64 : 65, ev.xbutton.x, ev.xbutton.y, 0, ev.xbutton.state);
                     else if (G.term->alt_active) { /* wheel scrolls fullscreen apps via arrow keys */
                         const char *a = up ? (G.term->app_cursor_keys ? "\033OA" : "\033[A")
@@ -2490,14 +2503,23 @@ int main(int argc, char **argv) {
                                       XInternAtom(G.dpy, "XSEL_DATA", False), G.win, ev.xkey.time);
                     continue;
                 }
-                /* Font size */
-                if ((st & ControlMask) && (st & ShiftMask) &&
-                    (ks == XK_plus || ks == XK_equal || ks == XK_minus || ks == XK_underscore || ks == XK_0 || ks == XK_parenright)) {
-                    if (ks == XK_plus || ks == XK_equal) font_resize(G_hw.font_sz + 1);
-                    else if (ks == XK_minus || ks == XK_underscore) font_resize(G_hw.font_sz - 1);
-                    else font_resize(CFG.size);
-                    render = 1;
-                    continue;
+                /* Font size: Ctrl+Minus / Ctrl+Equal(Plus) / Ctrl+0, with or without
+                 * Shift, plus the keypad keys. Match on the unshifted keysym so it works
+                 * on layouts where Shift+Minus isn't Underscore. */
+                if (st & ControlMask) {
+                    KeySym base = XLookupKeysym(&ev.xkey, 0);
+                    int dir = 0, reset = 0;
+                    if (ks == XK_plus || ks == XK_equal || base == XK_plus || base == XK_equal ||
+                        ks == XK_KP_Add) dir = +1;
+                    else if (ks == XK_minus || ks == XK_underscore || base == XK_minus ||
+                             ks == XK_KP_Subtract) dir = -1;
+                    else if (ks == XK_0 || ks == XK_parenright || base == XK_0 ||
+                             ks == XK_KP_0 || ks == XK_KP_Insert) reset = 1;
+                    if (dir || reset) {
+                        font_resize(reset ? CFG.size : G_hw.font_sz + dir);
+                        render = 1;
+                        continue;
+                    }
                 }
                 /* Scrollback search */
                 if ((st & ControlMask) && (st & ShiftMask) && (ks == XK_F || ks == XK_f) && !G.term->alt_active) {

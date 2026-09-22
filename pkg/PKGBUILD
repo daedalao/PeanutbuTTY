@@ -1,0 +1,39 @@
+# Maintainer: daedalao <daedalao@hotmail.com>
+pkgname=peanutbutty-git
+_pkgname=peanutbutty
+pkgver=r5.3151f0d
+pkgrel=1
+pkgdesc="OpenGL 2.0 terminal emulator (sixel, reflow, scrollback search, kitty keyboard protocol) - built for the PowerBook G4"
+arch=(powerpc ppc64le x86_64 aarch64)
+url="https://github.com/daedalao/PeanutbuTTY"
+license=(CC0-1.0)
+depends=(libx11 libgl freetype2 fontconfig hicolor-icon-theme)
+makedepends=(git pkgconf)
+optdepends=('xdg-utils: open URLs with Ctrl+click and URL hints')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("$_pkgname::git+https://github.com/daedalao/PeanutbuTTY.git")
+sha256sums=('SKIP')
+options=(!debug)
+
+pkgver() {
+    cd "$_pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd "$_pkgname"
+    # The Makefile carries its own tuned flags: -mcpu=7450/AltiVec on 32-bit
+    # PowerPC (the G4), POWER8 on ppc64le, plain -O3 elsewhere.
+    case "$CARCH" in
+        powerpc)  make ppc32 ;;
+        ppc64le)  make ppc64le ;;
+        *)        make native ;;
+    esac
+}
+
+package() {
+    cd "$_pkgname"
+    make DESTDIR="$pkgdir" PREFIX=/usr install
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

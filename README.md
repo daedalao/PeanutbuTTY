@@ -25,7 +25,7 @@ Inspired by Alacritty's clean aesthetic.
   resizes to the cell grid
 - Config file `~/.config/peanutbutty.conf` (font, size, colours, padding,
   scrollback, blink) — see `peanutbutty.conf.example`
-- Runtime font size: Ctrl+Shift+Plus / Minus / 0
+- Runtime font size: Ctrl+Plus / Minus / 0 (Shift optional), Ctrl+wheel
 - Window padding; DECSCUSR cursor shapes (block / underline / bar,
   blink or steady), hollow cursor when unfocused
 - Scrollback (5 000 lines default) — Shift+PageUp / PageDown, mouse wheel
@@ -76,8 +76,12 @@ Inspired by Alacritty's clean aesthetic.
 ```sh
 make ppc32     # on the G4: -mcpu=7450 -maltivec etc.
 make native    # everywhere else
-./PeanutBuTTY_app
+./peanutbutty
+sudo make install PREFIX=/usr/local   # binary, .desktop, icon, docs
 ```
+
+Arch Linux (any arch, including Arch POWER on the G4): `cd pkg && makepkg -si`
+builds and installs the `peanutbutty-git` package from this repository.
 
 ### Dependencies (runtime)
 
@@ -108,7 +112,8 @@ The default palette is Tomorrow Night.
 |-----------------------------|-------------------------------------------|
 | Ctrl+Shift+C                | Copy selection to CLIPBOARD (and PRIMARY) |
 | Ctrl+Shift+V                | Paste from CLIPBOARD                      |
-| Ctrl+Shift+Plus / Minus / 0 | Grow / shrink / reset font size           |
+| Ctrl+Plus / Minus / 0       | Grow / shrink / reset font size (Shift optional; keypad too) |
+| Ctrl+wheel                  | Grow / shrink font size                   |
 | Ctrl+Shift+F                | Search scrollback (Esc closes)            |
 | Ctrl+Shift+U                | URL hint mode: label key opens the URL    |
 | Ctrl+Shift+Up / Down        | Jump to previous / next prompt (OSC 133)  |

@@ -6,3 +6,9 @@ peanutbutty
 peanutbutty-og.c
 glterm_app
 gltermworking-1
+
+# makepkg output
+pkg/src/
+pkg/pkg/
+pkg/*.pkg.tar*
+pkg/*.log

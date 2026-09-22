@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PeanutBuTTY
+GenericName=Terminal
+Comment=OpenGL 2.0 terminal emulator
+Exec=peanutbutty
+Icon=peanutbutty
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;cmd;
+StartupWMClass=PeanutBuTTY
