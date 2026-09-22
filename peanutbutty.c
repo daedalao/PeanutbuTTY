@@ -2603,10 +2603,10 @@ int main(int argc, char **argv) {
                     }
                     if (kn) { write(G.pty_fd, kb, kn); continue; }
                 }
-                if (n > 0) {
-                    if (ev.xkey.state & Mod1Mask) { char esc = 0x1B; write(G.pty_fd, &esc, 1); }
-                    write(G.pty_fd, buf, n);
-                } else {
+                /* Keysym table first: X's lookup string turns Delete into 0x7f
+                 * (identical to Backspace) and Backspace into 0x08, so the
+                 * table must win; the lookup string is only for plain text. */
+                {
                     const char *seq = NULL; char sbuf[64];
                     int mod = 1 + (ev.xkey.state & ShiftMask ? 1 : 0) + (ev.xkey.state & Mod1Mask ? 2 : 0) + (ev.xkey.state & ControlMask ? 4 : 0);
                     
@@ -2648,7 +2648,13 @@ int main(int argc, char **argv) {
                             break;
                         case XK_Escape: seq = "\033"; break;
                     }
-                    if (seq) write(G.pty_fd, seq, strlen(seq));
+                    if (seq) {
+                        if ((ev.xkey.state & Mod1Mask) && (ks == XK_Return || ks == XK_Tab || ks == XK_BackSpace)) { char esc = 0x1B; write(G.pty_fd, &esc, 1); }
+                        write(G.pty_fd, seq, strlen(seq));
+                    } else if (n > 0) {
+                        if (ev.xkey.state & Mod1Mask) { char esc = 0x1B; write(G.pty_fd, &esc, 1); }
+                        write(G.pty_fd, buf, n);
+                    }
                 }
             }
         }
