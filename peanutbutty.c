@@ -1104,6 +1104,7 @@ static char *b64_encode(const char *s, size_t len) {
     return out;
 }
 
+static void retint_defaults(uint32_t ofg, uint32_t obg);
 static void term_handle_osc(Terminal *t) {
     if (t->osc_len < 1) return;
     t->osc_buf[t->osc_len] = 0;
@@ -1144,9 +1145,9 @@ static void term_handle_osc(Terminal *t) {
             int n = sprintf(resp, "\033]%d;rgb:%02x%02x/%02x%02x/%02x%02x\007", code,
                             (c>>16)&0xFF, (c>>16)&0xFF, (c>>8)&0xFF, (c>>8)&0xFF, c&0xFF, c&0xFF);
             write(G.pty_fd, resp, n);
-        } else parse_color_spec(arg, tgt);
-    } else if (code == 110) CFG.fg = CFG.fg0;
-    else if (code == 111) CFG.bg = CFG.bg0;
+        } else { uint32_t ofg = CFG.fg, obg = CFG.bg; parse_color_spec(arg, tgt); retint_defaults(ofg, obg); }
+    } else if (code == 110) { uint32_t o = CFG.fg; CFG.fg = CFG.fg0; retint_defaults(o, CFG.bg); }
+    else if (code == 111) { uint32_t o = CFG.bg; CFG.bg = CFG.bg0; retint_defaults(CFG.fg, o); }
     else if (code == 112) CFG.cursor = CFG.cur0;
     else if (code == 52 && arg) { /* clipboard access: 52;<sel>;<base64|?> */
         char *data = strchr(arg, ';');
@@ -1813,6 +1814,31 @@ static void font_resize(int newsz) {
     wm_set_size_hints();
 }
 
+/* After the default fg/bg change (config reload or OSC 10/11), cells and
+ * the parser's current colours that still wear the old defaults follow
+ * the new ones — otherwise a later erase paints the old colour explicitly. */
+static void retint_defaults(uint32_t ofg, uint32_t obg) {
+    Terminal *t = G.term;
+    if (!t || (ofg == CFG.fg && obg == CFG.bg)) return;
+    for (int pass = 0; pass < 3; pass++) {
+        int n = pass == 2 ? t->sb.count : t->rows;
+        for (int r = 0; r < n; r++) {
+            Line *l = pass == 0 ? &t->screen[r] : pass == 1 ? &t->alt_screen[r] : term_abs_line(t, r);
+            for (int c = 0; c < l->cols; c++) {
+                if (l->cells[c].fg == ofg) l->cells[c].fg = CFG.fg;
+                if (l->cells[c].bg == obg) l->cells[c].bg = CFG.bg;
+            }
+        }
+    }
+    if (t->fg == ofg) t->fg = CFG.fg;
+    if (t->bg == obg) t->bg = CFG.bg;
+    if (t->saved.fg == ofg) t->saved.fg = CFG.fg;
+    if (t->saved.bg == obg) t->saved.bg = CFG.bg;
+    if (t->saved_alt.fg == ofg) t->saved_alt.fg = CFG.fg;
+    if (t->saved_alt.bg == obg) t->saved_alt.bg = CFG.bg;
+    t->full_dirty = 1;
+}
+
 /* Live config reload (SIGUSR1 or the config file changing on disk).
  * Applies colours, blink, padding and font size; font family and
  * scrollback depth still require a restart. */
@@ -1822,21 +1848,7 @@ static void config_reapply(void) {
     uint32_t ofg = CFG.fg, obg = CFG.bg;
     config_load();
     palette_init();
-    if (ofg != CFG.fg || obg != CFG.bg) { /* retint cells still wearing the old defaults */
-        Terminal *t = G.term;
-        for (int pass = 0; pass < 3; pass++) {
-            int n = pass == 2 ? t->sb.count : t->rows;
-            for (int r = 0; r < n; r++) {
-                Line *l = pass == 0 ? &t->screen[r] : pass == 1 ? &t->alt_screen[r] : term_abs_line(t, r);
-                for (int c = 0; c < l->cols; c++) {
-                    if (l->cells[c].fg == ofg) l->cells[c].fg = CFG.fg;
-                    if (l->cells[c].bg == obg) l->cells[c].bg = CFG.bg;
-                }
-            }
-        }
-        if (t->fg == ofg) t->fg = CFG.fg;
-        if (t->bg == obg) t->bg = CFG.bg;
-    }
+    retint_defaults(ofg, obg);
     if (strcmp(oldfont, CFG.font))
         fprintf(stderr, "peanutbutty: font family change requires restart\n");
     strcpy(CFG.font, oldfont); /* loaded faces stay authoritative */
