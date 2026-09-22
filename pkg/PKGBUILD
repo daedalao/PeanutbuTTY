@@ -4,7 +4,7 @@ _pkgname=peanutbutty
 pkgver=r5.3151f0d
 pkgrel=1
 pkgdesc="OpenGL 2.0 terminal emulator (sixel, reflow, scrollback search, kitty keyboard protocol) - built for the PowerBook G4"
-arch=(powerpc ppc64le x86_64 aarch64)
+arch=(powerpc powerpc64le x86_64 aarch64)
 url="https://github.com/daedalao/PeanutbuTTY"
 license=(CC0-1.0)
 depends=(libx11 libgl freetype2 fontconfig hicolor-icon-theme)
@@ -27,7 +27,7 @@ build() {
     # PowerPC (the G4), POWER8 on ppc64le, plain -O3 elsewhere.
     case "$CARCH" in
         powerpc)  make ppc32 ;;
-        ppc64le)  make ppc64le ;;
+        powerpc64le|ppc64le) make ppc64le ;;
         *)        make native ;;
     esac
 }
