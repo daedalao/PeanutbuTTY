@@ -242,7 +242,19 @@ static void gl2_load(void) {
 typedef struct { uint32_t codepoint; uint32_t fg, bg, ul; uint16_t attrs; uint16_t comb; } Cell;
 typedef struct { Cell *cells; int cols; int dirty; int wrapped; int prompt; } Line;
 typedef struct { Line *lines; int head, count, cap; } ScrollBuf;
-typedef struct { float x, y, u, v; uint32_t color; uint32_t pad[3]; } Vertex;
+/* All-float vertex, 24 bytes. The colour travels as two floats (r*256+g,
+ * b*256+a; exact) unpacked in the vertex shader: with a GL_UNSIGNED_BYTE
+ * colour attribute, Mesa's r300 path on the big-endian G4 converted every
+ * vertex to 4 floats on the CPU at draw time (~15% of a cxxmatrix frame). */
+typedef struct { float x, y, u, v, c0, c1; } Vertex;
+
+/* Packed colour (memory bytes r,g,b,a — see rgba_bytes) -> the two
+ * vertex floats. */
+static inline void col2f(uint32_t packed, float *c0, float *c1) {
+    const uint8_t *b = (const uint8_t*)&packed;
+    *c0 = (float)(b[0] * 256 + b[1]);
+    *c1 = (float)(b[2] * 256 + b[3]);
+}
 typedef struct { int x, y; int pw; uint16_t attrs; uint32_t fg, bg; } SavedCursor;
 
 typedef struct { uint32_t id; int x, y, w, h; GLuint tex; int active; } SixelImg;
@@ -331,7 +343,16 @@ struct {
 } G_hw;
 
 /* --- Shaders --- */
-static const char *VERT_SRC = "#version 110\nattribute vec2 a_pos; attribute vec2 a_uv; attribute vec4 a_color;\nuniform mat4 u_proj; varying vec2 v_uv; varying vec4 v_color;\nvoid main() {\ngl_Position = u_proj * vec4(a_pos, 0.0, 1.0); v_uv = a_uv; v_color = a_color;\n}\n";
+static const char *VERT_SRC =
+    "#version 110\n"
+    "attribute vec2 a_pos; attribute vec2 a_uv; attribute vec2 a_color;\n"
+    "uniform mat4 u_proj; varying vec2 v_uv; varying vec4 v_color;\n"
+    "void main() {\n"
+    "    gl_Position = u_proj * vec4(a_pos, 0.0, 1.0); v_uv = a_uv;\n"
+    "    vec2 hi = floor(a_color / 256.0);\n"          /* (r, b) */
+    "    vec2 lo = a_color - hi * 256.0;\n"            /* (g, a) */
+    "    v_color = vec4(hi.x, lo.x, hi.y, lo.y) / 255.0;\n"
+    "}\n";
 /* Color packing: R300 GPU reads vertex attribute bytes in memory order as RGBA.
  * rgba_bytes() builds a uint32_t whose memory layout is [r,g,b,a] on either
  * endianness (big-endian G4: r<<24; little-endian POWER8/x86: r in low byte).
@@ -725,12 +746,17 @@ empty:
     return id;
 }
 
+/* floorf() is an out-of-line libm call on the 7450 (no frin), and the
+ * renderer floors four coordinates per quad. Exact for |x| < 2^31. */
+static inline float ffloor(float x) { int i = (int)x; return (float)(i - (x < (float)i)); }
+
 static void draw_rect_hw(Vertex *vbo, float x, float y, float w, float h, uint32_t color, int *v_idx) {
     Vertex *v = &vbo[*v_idx];
     float u = 8.0f / ATLAS_SIZE, v_uv = 8.0f / ATLAS_SIZE;
-    x = floorf(x); y = floorf(y); w = floorf(w); h = floorf(h);
-    v[0] = (Vertex){ x, y, u, v_uv, color, {0,0,0} }; v[1] = (Vertex){ x+w, y, u, v_uv, color, {0,0,0} };
-    v[2] = (Vertex){ x+w, y+h, u, v_uv, color, {0,0,0} }; v[3] = (Vertex){ x, y+h, u, v_uv, color, {0,0,0} };
+    x = ffloor(x); y = ffloor(y); w = ffloor(w); h = ffloor(h);
+    float c0, c1; col2f(color, &c0, &c1);
+    v[0] = (Vertex){ x, y, u, v_uv, c0, c1 }; v[1] = (Vertex){ x+w, y, u, v_uv, c0, c1 };
+    v[2] = (Vertex){ x+w, y+h, u, v_uv, c0, c1 }; v[3] = (Vertex){ x, y+h, u, v_uv, c0, c1 };
     *v_idx += 4;
 }
 
@@ -748,26 +774,28 @@ static void draw_glyph_hw(Vertex *vbo, int id, float x, float y, uint32_t color,
         float u0 = (float)G_hw.glyphs[id].u / CATLAS_SIZE, v0 = (float)G_hw.glyphs[id].v / CATLAS_SIZE;
         float u1 = (float)(G_hw.glyphs[id].u + G_hw.glyphs[id].w) / CATLAS_SIZE;
         float v1 = (float)(G_hw.glyphs[id].v + G_hw.glyphs[id].h) / CATLAS_SIZE;
-        float ox = floorf(x + (float)G_hw.glyphs[id].bl), oy = floorf(y + (float)(G_hw.font_as - G_hw.glyphs[id].bt));
+        float ox = ffloor(x + (float)G_hw.glyphs[id].bl), oy = ffloor(y + (float)(G_hw.font_as - G_hw.glyphs[id].bt));
         float w = (float)G_hw.glyphs[id].w, h = (float)G_hw.glyphs[id].h;
         uint8_t a = ((const uint8_t*)&color)[3]; /* memory byte 3 is alpha on either endianness */
         uint32_t c = rgba_bytes(a, a, a, a);     /* shader: texel * v_color (premultiplied) */
         Vertex *v = &cquads[cq_idx];
-        v[0] = (Vertex){ ox, oy, u0, v0, c, {0,0,0} }; v[1] = (Vertex){ ox+w, oy, u1, v0, c, {0,0,0} };
-        v[2] = (Vertex){ ox+w, oy+h, u1, v1, c, {0,0,0} }; v[3] = (Vertex){ ox, oy+h, u0, v1, c, {0,0,0} };
+        float c0, c1; col2f(c, &c0, &c1);
+        v[0] = (Vertex){ ox, oy, u0, v0, c0, c1 }; v[1] = (Vertex){ ox+w, oy, u1, v0, c0, c1 };
+        v[2] = (Vertex){ ox+w, oy+h, u1, v1, c0, c1 }; v[3] = (Vertex){ ox, oy+h, u0, v1, c0, c1 };
         cq_idx += 4;
         return;
     }
     float u0 = (float)G_hw.glyphs[id].u / ATLAS_SIZE, v0 = (float)G_hw.glyphs[id].v / ATLAS_SIZE;
     float u1 = (float)(G_hw.glyphs[id].u + G_hw.glyphs[id].w) / ATLAS_SIZE;
     float v1 = (float)(G_hw.glyphs[id].v + G_hw.glyphs[id].h) / ATLAS_SIZE;
-    float ox = floorf(x + (float)G_hw.glyphs[id].bl), oy = floorf(y + (float)(G_hw.font_as - G_hw.glyphs[id].bt));
+    float ox = ffloor(x + (float)G_hw.glyphs[id].bl), oy = ffloor(y + (float)(G_hw.font_as - G_hw.glyphs[id].bt));
     float w = (float)G_hw.glyphs[id].w, h = (float)G_hw.glyphs[id].h;
     /* Synthetic oblique: shear the quad's top edge right by ~1/5 of its height */
-    float sh = italic ? floorf(h * 0.2f + 0.5f) : 0.0f;
+    float sh = italic ? ffloor(h * 0.2f + 0.5f) : 0.0f;
     Vertex *v = &vbo[*v_idx];
-    v[0] = (Vertex){ ox+sh, oy, u0, v0, color, {0,0,0} }; v[1] = (Vertex){ ox+w+sh, oy, u1, v0, color, {0,0,0} };
-    v[2] = (Vertex){ ox+w, oy+h, u1, v1, color, {0,0,0} }; v[3] = (Vertex){ ox, oy+h, u0, v1, color, {0,0,0} };
+    float c0, c1; col2f(color, &c0, &c1);
+    v[0] = (Vertex){ ox+sh, oy, u0, v0, c0, c1 }; v[1] = (Vertex){ ox+w+sh, oy, u1, v0, c0, c1 };
+    v[2] = (Vertex){ ox+w, oy+h, u1, v1, c0, c1 }; v[3] = (Vertex){ ox, oy+h, u0, v1, c0, c1 };
     *v_idx += 4;
 }
 
@@ -834,10 +862,11 @@ static void draw_tri_hw(Vertex *vbo, float x0, float y0, float x1, float y1,
                         float x2, float y2, uint32_t color, int *v_idx) {
     float u = 8.0f / ATLAS_SIZE;
     Vertex *v = &vbo[*v_idx];
-    v[0] = (Vertex){ x0, y0, u, u, color, {0,0,0} };
-    v[1] = (Vertex){ x1, y1, u, u, color, {0,0,0} };
-    v[2] = (Vertex){ x2, y2, u, u, color, {0,0,0} };
-    v[3] = (Vertex){ x2, y2, u, u, color, {0,0,0} };
+    float c0, c1; col2f(color, &c0, &c1);
+    v[0] = (Vertex){ x0, y0, u, u, c0, c1 };
+    v[1] = (Vertex){ x1, y1, u, u, c0, c1 };
+    v[2] = (Vertex){ x2, y2, u, u, c0, c1 };
+    v[3] = (Vertex){ x2, y2, u, u, c0, c1 };
     *v_idx += 4;
 }
 
@@ -1914,6 +1943,24 @@ static void hints_build(Terminal *t) {
     G.hints.active = G.hints.n > 0;
 }
 
+/* Every 4 vertices form a quad (v0 TL, v1 TR, v2 BR, v3 BL), drawn with
+ * GL_QUADS. Tried and measured on the G4 (RV350, Mesa 26): indexed
+ * GL_TRIANGLES from a static index buffer, 16- or 32-bit, drops cxxmatrix
+ * from ~40 to ~5 fps (the driver stalls on the index buffer every draw),
+ * so stay with quads. */
+/* Point the program's attributes at the bound VBO for draw_quads(). */
+static void use_attribs(GLint pos, GLint uv, GLint col) {
+    glEnableVertexAttribArray(pos); glEnableVertexAttribArray(uv); glEnableVertexAttribArray(col);
+    glVertexAttribPointer(pos, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
+    glVertexAttribPointer(uv,  2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)8);
+    glVertexAttribPointer(col, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)16);
+}
+
+/* Draw `count` vertices (a multiple of 4) from vertex `first` as quads. */
+static void draw_quads(int first, int count) {
+    if (count > 0) glDrawArrays(GL_QUADS, first, count);
+}
+
 /* --- Optimized Rendering Engine --- */
 static void render_frame(void) {
     Terminal *t = G.term;
@@ -2098,31 +2145,23 @@ static void render_frame(void) {
     glBindTexture(GL_TEXTURE_2D, G_hw.atlas_tex);
     glBindBuffer(GL_ARRAY_BUFFER, G_hw.vbo[G_hw.current_vbo]);
     glBufferSubData(GL_ARRAY_BUFFER, 0, v_idx * sizeof(Vertex), vbo_ptr);
-    glEnableVertexAttribArray(G.a_pos); glEnableVertexAttribArray(G.a_uv); glEnableVertexAttribArray(G.a_color);
-    glVertexAttribPointer(G.a_pos, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
-    glVertexAttribPointer(G.a_uv, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)8);
-    glVertexAttribPointer(G.a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), (void*)16);
+    use_attribs(G.a_pos, G.a_uv, G.a_color);
     if (cq_idx > 0 && G.cprog && G_hw.catlas_tex && v_idx + cq_idx <= G_hw.max_vertices) {
-        glDrawArrays(GL_QUADS, 0, v_text_end);
+        draw_quads(0, v_text_end);
         /* colour pass: same buffer, appended after the mono vertices */
         glBufferSubData(GL_ARRAY_BUFFER, v_idx * sizeof(Vertex), cq_idx * sizeof(Vertex), cquads);
         glUseProgram(G.cprog); glUniformMatrix4fv(G.cu_proj, 1, GL_FALSE, g_proj); glUniform1i(G.cu_tex, 0);
         glBindTexture(GL_TEXTURE_2D, G_hw.catlas_tex);
-        glEnableVertexAttribArray(G.ca_pos); glEnableVertexAttribArray(G.ca_uv); glEnableVertexAttribArray(G.ca_color);
-        glVertexAttribPointer(G.ca_pos, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
-        glVertexAttribPointer(G.ca_uv, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)8);
-        glVertexAttribPointer(G.ca_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), (void*)16);
-        glDrawArrays(GL_QUADS, v_idx, cq_idx);
+        use_attribs(G.ca_pos, G.ca_uv, G.ca_color);
+        draw_quads(v_idx, cq_idx);
         /* back to the mono program for overlays (cursor, bell, search, hints) */
         glUseProgram(G.prog);
         glBindTexture(GL_TEXTURE_2D, G_hw.atlas_tex);
-        glVertexAttribPointer(G.a_pos, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
-        glVertexAttribPointer(G.a_uv, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)8);
-        glVertexAttribPointer(G.a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), (void*)16);
-        if (v_idx > v_text_end) glDrawArrays(GL_QUADS, v_text_end, v_idx - v_text_end);
+        use_attribs(G.a_pos, G.a_uv, G.a_color);
+        draw_quads(v_text_end, v_idx - v_text_end);
         v_idx += cq_idx; /* sixel quads go after the colour quads */
     } else {
-        glDrawArrays(GL_QUADS, 0, v_idx);
+        draw_quads(0, v_idx);
     }
 
     int nsix = t->sixel_count < 64 ? t->sixel_count : 64;
@@ -2132,7 +2171,7 @@ static void render_frame(void) {
             glBindTexture(GL_TEXTURE_2D, s->tex); int sv_idx = 0;
             draw_rect_hw(vbo_ptr + v_idx, (float)s->x, (float)s->y, (float)s->w, (float)s->h, pack_color(0xFFFFFF, 255), &sv_idx);
             glBufferSubData(GL_ARRAY_BUFFER, v_idx * sizeof(Vertex), sv_idx * sizeof(Vertex), vbo_ptr + v_idx);
-            glDrawArrays(GL_QUADS, v_idx, sv_idx);
+            draw_quads(v_idx, sv_idx);
         }
     }
     glXSwapBuffers(G.dpy, G.win);
