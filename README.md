@@ -62,8 +62,15 @@ Inspired by Alacritty's clean aesthetic.
   reload; font family and scrollback depth still need a restart
 - **XIM input method** support (ibus/fcitx, dead keys) via
   `Xutf8LookupString`, falling back to core lookup
-- **OSC 7** working-directory tracking (stored for future tab/window
-  inheritance)
+- **New window in the same directory** (Ctrl+Shift+N): uses the OSC 7
+  path when the shell reports one for this host, otherwise the foreground
+  process's working directory from /proc (no shell integration needed)
+- **Desktop notifications**: OSC 9 (`\e]9;message\a`) and OSC 777
+  (`\e]777;notify;title;body\a`) go to `notify-send` while the window is
+  unfocused (rate-limited; ConEmu `9;4` progress codes ignored);
+  `notify = no` turns them off
+- Mouse pointer hides while typing and returns on movement
+  (`hide_pointer = no` to disable)
 - Mouse reporting: X10 / normal / button-motion / any-motion (1000/1002/1003),
   SGR extended coords (1006); Shift overrides for local selection
 - Wheel scrolls scrollback on the main screen, sends arrows on the alt screen
@@ -125,6 +132,7 @@ The default palette is Tomorrow Night.
 | Ctrl+wheel                  | Grow / shrink font size                   |
 | Ctrl+Shift+F                | Search scrollback (Esc closes)            |
 | Ctrl+Shift+U                | URL hint mode: label key opens the URL    |
+| Ctrl+Shift+N                | New window in the current directory       |
 | Ctrl+Shift+Up / Down        | Jump to previous / next prompt (OSC 133)  |
 | Middle click                | Paste from PRIMARY                        |
 | Double / triple click       | Select word / line                        |

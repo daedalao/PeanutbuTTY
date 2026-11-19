@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <sys/stat.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <errno.h>
@@ -63,6 +64,7 @@
 static struct Cfg {
     char font[128];
     int size, padding, scrollback, blink_ms;
+    int notify, hide_pointer;          /* OSC 9/777 desktop notifications; hide pointer while typing */
     uint32_t fg, bg, cursor;
     uint32_t fg0, bg0, cur0;          /* startup values, for OSC 110/111/112 reset */
     uint32_t pal[16]; int pal_set[16]; /* per-slot palette overrides */
@@ -73,6 +75,10 @@ static struct Cfg {
 #define COLOR_CURSOR    CFG.cursor
 #define SCROLLBACK      CFG.scrollback
 #define BLINK_MS        CFG.blink_ms
+
+static int cfg_bool(const char *v) {
+    return !strcasecmp(v, "yes") || !strcasecmp(v, "true") || !strcasecmp(v, "on") || !strcmp(v, "1");
+}
 
 static int parse_hex_color(const char *s, uint32_t *out) {
     if (*s == '#') s++;
@@ -88,6 +94,7 @@ static void on_sigusr1(int s) { (void)s; reload_requested = 1; }
 static void config_load(void) {
     strcpy(CFG.font, "monospace");
     CFG.size = 12; CFG.padding = 8; CFG.scrollback = 5000; CFG.blink_ms = 530;
+    CFG.notify = 1; CFG.hide_pointer = 1;
     CFG.fg = 0xc5c8c6; CFG.bg = 0x000000; CFG.cursor = 0xaeafad;
     memset(CFG.pal_set, 0, sizeof(CFG.pal_set));
     char path[512];
@@ -112,6 +119,8 @@ static void config_load(void) {
             else if (!strcmp(key, "padding")) { int v = atoi(val); if (v >= 0 && v <= 64) CFG.padding = v; }
             else if (!strcmp(key, "scrollback")) { int v = atoi(val); if (v >= 0 && v <= 100000) CFG.scrollback = v > 0 ? v : 1; }
             else if (!strcmp(key, "blink")) { int v = atoi(val); if (v >= 100 && v <= 5000) CFG.blink_ms = v; }
+            else if (!strcmp(key, "notify")) CFG.notify = cfg_bool(val);
+            else if (!strcmp(key, "hide_pointer")) CFG.hide_pointer = cfg_bool(val);
             else if (!strcmp(key, "foreground")) parse_hex_color(val, &CFG.fg);
             else if (!strcmp(key, "background")) parse_hex_color(val, &CFG.bg);
             else if (!strcmp(key, "cursor")) parse_hex_color(val, &CFG.cursor);
@@ -295,6 +304,7 @@ typedef struct Terminal {
     uint64_t sync_deadline; /* mode 2026 safety timeout */
     int kitty_stack[8]; int kitty_n; /* kitty keyboard protocol flag stack; [0] is the always-present base */
     char cwd[512];    /* OSC 7 reported working directory (percent-decoded path) */
+    int cwd_local;    /* ...and it was reported for this host (not from inside ssh) */
 } Terminal;
 
 #define CP_WIDE_CONTINUATION 0xFFFFFFFE
@@ -304,7 +314,7 @@ static struct {
     int win_w, win_h; GLuint prog; GLint u_proj, u_tex, u_win_h, u_win_w, a_pos, a_uv, a_color;
     GLuint cprog; GLint cu_proj, cu_tex, ca_pos, ca_uv, ca_color; /* colour-glyph (emoji) program */
     Terminal *term; int pty_fd; pid_t child_pid; int cursor_phase, running;
-    Cursor ptr_hand, ptr_text;
+    Cursor ptr_hand, ptr_text, ptr_blank; int ptr_hidden; /* blank = hidden while typing */
     char *sel_text;            /* owned selection contents served to requestors */
     int last_mrx, last_mry;    /* last mouse-report cell, to dedupe motion events */
     int focused;               /* window focus, for hollow cursor / blink gating */
@@ -1493,6 +1503,58 @@ static char *b64_encode(const char *s, size_t len) {
 }
 
 static void retint_defaults(uint32_t ofg, uint32_t obg);
+/* Run argv detached in dir (NULL = ours). Double fork: the grandchild is
+ * reparented to init, so it never lingers as our zombie. The child gets
+ * default signal handling and none of our descriptors (pty master, X
+ * connection, inotify). */
+static void spawn_detached(char *const argv[], const char *dir) {
+    pid_t p = fork();
+    if (p < 0) return;
+    if (p == 0) {
+        if (fork() == 0) {
+            setsid();
+            for (int fd = 3; fd < 1024; fd++) close(fd);
+            static const int sigs[] = { SIGPIPE, SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGCHLD, SIGUSR1 };
+            for (unsigned i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++) signal(sigs[i], SIG_DFL);
+            sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
+            if (dir && *dir && chdir(dir) != 0) { /* stay where we are */ }
+            execvp(argv[0], argv);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    waitpid(p, NULL, 0);
+}
+
+/* Copy s into out (size n) with control characters as spaces and the
+ * markup notification servers interpret (& < >) escaped. */
+static void notify_clean(const char *s, char *out, size_t n) {
+    size_t o = 0;
+    for (; *s && o + 6 < n; s++) {
+        unsigned char c = (unsigned char)*s;
+        const char *e = c == '&' ? "&amp;" : c == '<' ? "&lt;" : c == '>' ? "&gt;" : NULL;
+        if (e) { size_t l = strlen(e); memcpy(out + o, e, l); o += l; }
+        else out[o++] = (c < 0x20 || c == 0x7F) ? ' ' : (char)c;
+    }
+    out[o] = 0;
+}
+
+/* Desktop notification via notify-send (libnotify), only while the window
+ * is unfocused — when you're looking at the terminal you already see it.
+ * At most one per second, so output can't flood the desktop. */
+static void notify_desktop(const char *title, const char *body) {
+    static uint64_t last;
+    if (!CFG.notify || G.focused) return;
+    uint64_t now = now_ms();
+    if (last && now - last < 1000) return;
+    last = now;
+    char t[256], b[1024];
+    notify_clean(title, t, sizeof(t)); notify_clean(body, b, sizeof(b));
+    char *argv[] = { "notify-send", "-a", "peanutbutty", "-i", "peanutbutty", "--", t, b, NULL };
+    spawn_detached(argv, NULL);
+    set_urgency(1);
+}
+
 static void term_handle_osc(Terminal *t) {
     if (t->osc_len < 1) return;
     t->osc_buf[t->osc_len] = 0;
@@ -1537,6 +1599,18 @@ static void term_handle_osc(Terminal *t) {
     } else if (code == 110) { uint32_t o = CFG.fg; CFG.fg = CFG.fg0; retint_defaults(o, CFG.bg); }
     else if (code == 111) { uint32_t o = CFG.bg; CFG.bg = CFG.bg0; retint_defaults(CFG.fg, o); }
     else if (code == 112) CFG.cursor = CFG.cur0;
+    else if (code == 9 && arg) { /* iTerm2/ConEmu notification: 9;<message> */
+        /* "9;<number>;..." are ConEmu subcommands (9;4 = progress, sent by
+         * systemd and others), not messages. */
+        const char *q = arg; while (isdigit((unsigned char)*q)) q++;
+        if (!(q > arg && (*q == ';' || *q == 0)))
+            notify_desktop(t->title[0] ? t->title : "peanutbutty", arg);
+    }
+    else if (code == 777 && arg && !strncmp(arg, "notify;", 7)) { /* urxvt/foot: 777;notify;<title>;<body> */
+        char *title = arg + 7, *body = strchr(title, ';');
+        if (body) *body++ = 0;
+        notify_desktop(*title ? title : "peanutbutty", body ? body : "");
+    }
     else if (code == 52 && arg) { /* clipboard access: 52;<sel>;<base64|?> */
         char *data = strchr(arg, ';');
         if (data) {
@@ -1561,7 +1635,17 @@ static void term_handle_osc(Terminal *t) {
         }
     } else if (code == 7 && arg) { /* working directory: 7;file://host/path */
         const char *p = strncmp(arg, "file://", 7) ? arg : arg + 7;
-        if (*p && *p != '/') { p = strchr(p, '/'); if (!p) p = ""; } /* skip hostname */
+        t->cwd_local = 1;
+        if (*p && *p != '/') { /* hostname: only trust paths reported for this machine */
+            const char *slash = strchr(p, '/');
+            char host[256], me[256] = "";
+            size_t hl = slash ? (size_t)(slash - p) : strlen(p);
+            if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+            memcpy(host, p, hl); host[hl] = 0;
+            gethostname(me, sizeof(me) - 1);
+            t->cwd_local = !strcmp(host, "localhost") || !strcasecmp(host, me);
+            p = slash ? slash : "";
+        }
         int o = 0;
         while (*p && o < (int)sizeof(t->cwd)-1) { /* percent-decode */
             if (p[0] == '%' && isxdigit(p[1]) && isxdigit(p[2])) {
@@ -1924,6 +2008,32 @@ static void search_move(Terminal *t, int dir) {
     /* no match in that direction: stay put */
 }
 
+/* Ctrl+Shift+N: start another peanutbutty in the directory you're in. The
+ * OSC 7 path when the shell reported one for this host; otherwise the
+ * foreground process's cwd (an inner shell, vim...), then the shell's —
+ * Linux /proc, so it works without shell integration. */
+static void new_window(void) {
+    Terminal *t = G.term;
+    char dir[PATH_MAX] = "";
+    struct stat sb;
+    if (t->cwd[0] == '/' && t->cwd_local && stat(t->cwd, &sb) == 0 && S_ISDIR(sb.st_mode))
+        snprintf(dir, sizeof(dir), "%s", t->cwd);
+    else {
+        pid_t cand[2] = { tcgetpgrp(G.pty_fd), G.child_pid };
+        for (int i = 0; i < 2 && !dir[0]; i++) {
+            if (cand[i] <= 0) continue;
+            char link[64]; snprintf(link, sizeof(link), "/proc/%d/cwd", (int)cand[i]);
+            ssize_t n = readlink(link, dir, sizeof(dir) - 1);
+            dir[n > 0 ? n : 0] = 0;
+        }
+    }
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) exe[n] = 0; else snprintf(exe, sizeof(exe), "peanutbutty");
+    char *argv[] = { exe, NULL };
+    spawn_detached(argv, dir[0] ? dir : NULL);
+}
+
 /* --- URL opening + keyboard hints --- */
 static void open_url_run(Line *ln, int start, int end) {
     char url[MAX_OSC]; char *p = url;
@@ -1933,7 +2043,8 @@ static void open_url_run(Line *ln, int start, int end) {
         utf8_encode(&p, cp);
     }
     *p = 0;
-    if (fork() == 0) { execlp("xdg-open", "xdg-open", url, NULL); _exit(0); }
+    char *argv[] = { "xdg-open", url, NULL };
+    spawn_detached(argv, NULL);
 }
 
 static void hints_build(Terminal *t) {
@@ -2730,6 +2841,13 @@ int main(int argc, char **argv) {
     struct winsize ws = { (unsigned short)rows, (unsigned short)cols, 0, 0 };
     int master, slave; openpty(&master, &slave, NULL, NULL, &ws); G.pty_fd = master; G.child_pid = fork();
     if (G.child_pid == 0) { setsid(); ioctl(slave, TIOCSCTTY, 0); dup2(slave, 0); dup2(slave, 1); dup2(slave, 2);
+        /* Ignored signals survive exec: without this every program in the
+         * terminal inherited our SIG_IGN for SIGPIPE ("yes | head" printed
+         * "Broken pipe"), and SIGINT/SIGQUIT if our launcher ignored them. */
+        static const int sigs[] = { SIGPIPE, SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGCHLD, SIGUSR1 };
+        for (unsigned i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++) signal(sigs[i], SIG_DFL);
+        sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
+        for (int fd = 3; fd < 1024; fd++) close(fd); /* X connection, pty master, inotify */
         setenv("TERM", "xterm-256color", 1); setenv("COLORTERM", "truecolor", 1);
         const char *sh = getenv("SHELL"); if (!sh || !*sh) sh = "/bin/sh";
         execl(sh, sh, NULL); _exit(127); }
@@ -2740,6 +2858,12 @@ int main(int argc, char **argv) {
     G.ptr_text = XCreateFontCursor(G.dpy, 152); /* XC_xterm */
     G.ptr_hand = XCreateFontCursor(G.dpy, 60);  /* XC_hand2 */
     XDefineCursor(G.dpy, G.win, G.ptr_text);
+    { /* invisible pointer for hide-while-typing: 1x1 empty bitmap */
+        static char none[1] = { 0 }; XColor black; memset(&black, 0, sizeof(black));
+        Pixmap pm = XCreateBitmapFromData(G.dpy, G.win, none, 1, 1);
+        G.ptr_blank = XCreatePixmapCursor(G.dpy, pm, pm, &black, &black, 0, 0);
+        XFreePixmap(G.dpy, pm);
+    }
     
     fcntl(master, F_SETFL, O_NONBLOCK); G.running = 1; uint64_t last_blink = 0;
     while (G.running) {
@@ -2803,6 +2927,7 @@ int main(int argc, char **argv) {
                 }
             }
             else if (ev.type == MotionNotify) {
+                G.ptr_hidden = 0; /* the handler below re-defines the visible pointer */
                 int cx = px_col(ev.xmotion.x);
                 int cy = px_row(ev.xmotion.y);
                 int report = G.term->mouse_mode && !(ev.xmotion.state & ShiftMask);
@@ -2825,6 +2950,7 @@ int main(int argc, char **argv) {
                 }
             }
             else if (ev.type == ButtonPress) {
+                if (G.ptr_hidden) { XDefineCursor(G.dpy, G.win, G.ptr_text); G.ptr_hidden = 0; }
                 int report = G.term->mouse_mode && !(ev.xbutton.state & ShiftMask);
                 if (ev.xbutton.button == 4 || ev.xbutton.button == 5) {
                     int up = (ev.xbutton.button == 4);
@@ -2861,12 +2987,7 @@ int main(int argc, char **argv) {
                             int start = cx, end = cx;
                             while (start > 0 && (ln->cells[start-1].attrs & ATTR_URL)) start--;
                             while (end < ln->cols-1 && (ln->cells[end+1].attrs & ATTR_URL)) end++;
-                            char url[MAX_OSC] = {0};
-                            for (int i=0; i<=(end-start) && i<MAX_OSC-1; i++) url[i] = (char)ln->cells[start+i].codepoint;
-                            if (fork() == 0) {
-                                execlp("xdg-open", "xdg-open", url, NULL);
-                                exit(0);
-                            }
+                            open_url_run(ln, start, end); /* UTF-8 aware, detached */
                         } else if (G.click_count == 2 && cx < ln->cols) { /* word select */
                             #define IS_WORD(cp) ((cp) > 127 || isalnum((int)(cp)) || strchr("-_./~", (int)(cp)))
                             int s2 = cx, e2 = cx;
@@ -2949,6 +3070,14 @@ int main(int argc, char **argv) {
                     if (xst == XBufferOverflow) n = 0;
                 } else n = XLookupString(&ev.xkey, buf, sizeof(buf), &ks, NULL);
                 unsigned st = ev.xkey.state;
+                if (CFG.hide_pointer && !G.ptr_hidden && !IsModifierKey(ks) && G.ptr_blank) {
+                    XDefineCursor(G.dpy, G.win, G.ptr_blank); G.ptr_hidden = 1;
+                }
+                /* New window in the same directory */
+                if ((st & ControlMask) && (st & ShiftMask) && (ks == XK_N || ks == XK_n)) {
+                    new_window();
+                    continue;
+                }
                 /* URL hint mode: a label opens the URL; any other character key exits */
                 if (G.hints.active) {
                     if (n == 0) continue; /* bare modifiers keep the mode alive */

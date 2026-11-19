@@ -14,6 +14,13 @@ scrollback = 5000
 # Cursor blink period in milliseconds (100-5000)
 blink = 530
 
+# Desktop notifications from OSC 9 / OSC 777 (via notify-send, only while
+# the window is unfocused)
+notify = yes
+
+# Hide the mouse pointer while typing; it returns when the mouse moves
+hide_pointer = yes
+
 # Colours, hex RRGGBB (leading # optional)
 foreground = c5c8c6
 background = 000000
