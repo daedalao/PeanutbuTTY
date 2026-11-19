@@ -25,7 +25,8 @@ Inspired by Alacritty's clean aesthetic.
   a single texture fetch per fragment; atlases flush and rebuild when full
 - **Procedural box drawing**: U+2500-257F box/line characters (light,
   heavy, double, dashed), U+2580-259F block elements/shades/quadrants and
-  powerline triangles (U+E0B0/E0B2) are drawn as exact-cell-geometry quads
+  powerline triangles (U+E0B0/E0B2) and braille patterns (U+2800-28FF,
+  btop/gping/drawille graphs) are drawn as exact-cell-geometry quads
   instead of font glyphs — tmux borders and TUI frames are seamless at any
   font size
 - **Reflow**: soft-wrapped lines re-wrap to the new width on resize

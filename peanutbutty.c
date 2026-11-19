@@ -900,6 +900,20 @@ static int draw_special_hw(Vertex *vbo, uint32_t cp, float fx, float fy,
         }
         return 1;
     }
+    if (cp >= 0x2800 && cp <= 0x28FF) { /* braille: 2x4 dots on the exact cell grid (btop, gping, drawille) */
+        /* Bit -> (column, row): dots 1-3 left, 4-6 right, 7/8 bottom row. */
+        static const uint8_t bc[8] = { 0, 0, 0, 1, 1, 1, 0, 1 }, br[8] = { 0, 1, 2, 0, 1, 2, 3, 3 };
+        unsigned m = cp - 0x2800;
+        int cw = w / 2, rh = h / 4, mn = cw < rh ? cw : rh;
+        int d = (mn + 1) / 2; if (d < 1) d = 1;   /* dot size: half the band, leaving gaps */
+        for (int b = 0; b < 8; b++) {
+            if (!(m & (1u << b))) continue;
+            int x0 = bc[b] ? cw : 0, x1 = bc[b] ? w : cw;            /* column band */
+            int y0 = h * br[b] / 4, y1 = h * (br[b] + 1) / 4;        /* row band */
+            RECT(x + x0 + (x1 - x0 - d) / 2, y + y0 + (y1 - y0 - d) / 2, d, d);
+        }
+        return 1;
+    }
     if (cp == 0xE0B0) { draw_tri_hw(vbo, fx, fy, fx+w, fy+h/2.0f, fx, fy+h, col, v_idx); return 1; }
     if (cp == 0xE0B2) { draw_tri_hw(vbo, fx+w, fy, fx, fy+h/2.0f, fx+w, fy+h, col, v_idx); return 1; }
     if (cp < 0x2500 || cp > 0x257F) return 0;
