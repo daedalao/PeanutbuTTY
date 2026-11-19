@@ -59,6 +59,6 @@ install: $(TARGET)
 	install -Dm644 peanutbutty.conf.example $(DESTDIR)$(PREFIX)/share/doc/peanutbutty/peanutbutty.conf.example
 	install -Dm644 README.md $(DESTDIR)$(PREFIX)/share/doc/peanutbutty/README.md
 
-# Regenerate the embedded window icon + peanutbutty.png from peanutbuttyicon.jpg (needs python3 + Pillow)
+# Regenerate the embedded window icon + peanutbutty.png from peanutbuttyicon.png (needs python3 + Pillow)
 icon:
 	python3 gen_icon.py
