@@ -545,6 +545,24 @@ static int cp_invisible(uint32_t cp) {
            cp == 0x034F || cp == 0x00AD;
 }
 
+/* Half-width katakana/punctuation (U+FF61-FF9F) -> full-width form, used
+ * when no installed font has the half-width glyph (common: many CJK fonts,
+ * e.g. M+, only carry the full-width ones). cxxmatrix rains these. */
+static uint32_t halfwidth_alt(uint32_t cp) {
+    static const uint16_t map[] = {
+        0x3002, 0x300C, 0x300D, 0x3001, 0x30FB,                         /* FF61-FF65 */
+        0x30F2, 0x30A1, 0x30A3, 0x30A5, 0x30A7, 0x30A9, 0x30E3, 0x30E5, /* FF66-FF6D */
+        0x30E7, 0x30C3, 0x30FC, 0x30A2, 0x30A4, 0x30A6, 0x30A8, 0x30AA, /* FF6E-FF75 */
+        0x30AB, 0x30AD, 0x30AF, 0x30B1, 0x30B3, 0x30B5, 0x30B7, 0x30B9, /* FF76-FF7D */
+        0x30BB, 0x30BD, 0x30BF, 0x30C1, 0x30C4, 0x30C6, 0x30C8, 0x30CA, /* FF7E-FF85 */
+        0x30CB, 0x30CC, 0x30CD, 0x30CE, 0x30CF, 0x30D2, 0x30D5, 0x30D8, /* FF86-FF8D */
+        0x30DB, 0x30DE, 0x30DF, 0x30E0, 0x30E1, 0x30E2, 0x30E4, 0x30E6, /* FF8E-FF95 */
+        0x30E8, 0x30E9, 0x30EA, 0x30EB, 0x30EC, 0x30ED, 0x30EF, 0x30F3, /* FF96-FF9D */
+        0x309B, 0x309C,                                                 /* FF9E-FF9F */
+    };
+    return (cp >= 0xFF61 && cp <= 0xFF9F) ? map[cp - 0xFF61] : 0;
+}
+
 /* Rasterise cp into the right atlas. Returns a glyph id, or -1 when the
  * atlas/table is full (G_hw.atlas_full is set; the next frame flushes).
  * Glyphs that fail to load are cached as empty, so they aren't retried
@@ -566,6 +584,13 @@ static int get_glyph(uint32_t cp, int style) {
     G_hw.glyphs[id].key = key;
 
     FT_Face face = face_for(cp, style);
+    /* No font has this half-width form: borrow the full-width glyph and
+     * squeeze it horizontally into the single cell. */
+    uint32_t load_cp = cp; int squeeze = 0;
+    if (!FT_Get_Char_Index(face, cp) && halfwidth_alt(cp)) {
+        FT_Face af = face_for(halfwidth_alt(cp), style);
+        if (FT_Get_Char_Index(af, halfwidth_alt(cp))) { face = af; load_cp = halfwidth_alt(cp); squeeze = 1; }
+    }
     int primary = (face == G_hw.ft_face || face == G_hw.style_faces[style]);
     int cells = (wcwidth(cp) == 2) ? 2 : 1;
     int box_w = cells * G_hw.font_w, box_h = G_hw.font_h;
@@ -573,19 +598,19 @@ static int get_glyph(uint32_t cp, int style) {
 #ifdef FT_LOAD_COLOR
     if (FT_HAS_COLOR(face)) flags |= FT_LOAD_COLOR;
 #endif
-    if (cp_invisible(cp) || FT_Load_Char(face, cp, flags)) goto empty;
+    if (cp_invisible(cp) || FT_Load_Char(face, load_cp, flags)) goto empty;
 
     /* Fallback glyphs may overhang the cell by a quarter cell (centred);
      * anything bigger is shrunk to fit rather than spill into neighbours. */
     int slack = G_hw.font_w / 4;
     int bt0 = face->glyph->bitmap_top, bh0 = (int)face->glyph->bitmap.rows; /* for re-centring */
-    if (!primary && FT_IS_SCALABLE(face) && face->glyph->bitmap.pixel_mode != FT_PIXEL_MODE_BGRA) {
+    if (!primary && !squeeze && FT_IS_SCALABLE(face) && face->glyph->bitmap.pixel_mode != FT_PIXEL_MODE_BGRA) {
         int bw = (int)face->glyph->bitmap.width, bh = (int)face->glyph->bitmap.rows;
         if (bw > box_w + slack || bh > box_h) {
             float s = fminf((float)box_w / (bw ? bw : 1), (float)box_h / (bh ? bh : 1));
             int nsz = (int)(G_hw.font_sz * s); if (nsz < 4) nsz = 4;
             FT_Set_Pixel_Sizes(face, 0, nsz);
-            int err = FT_Load_Char(face, cp, flags);
+            int err = FT_Load_Char(face, load_cp, flags);
             FT_Set_Pixel_Sizes(face, 0, G_hw.font_sz);
             if (err) goto empty;
         }
@@ -634,7 +659,18 @@ static int get_glyph(uint32_t cp, int style) {
      * (non-scalable fonts) are scaled down. Scaled glyphs keep their
      * baseline proportion and are clamped inside the line. */
     int dw = sw, dh = sh;
-    if (color || (!primary && (sw > box_w + slack || sh > box_h))) {
+    if (squeeze) { /* horizontal-only squeeze; height kept unless it overflows the line */
+        dw = sw > box_w ? box_w : sw;
+        dh = sh > box_h ? box_h : sh;
+        if (dw != sw || dh != sh) {
+            uint8_t *sc = malloc((size_t)dw * dh * ch);
+            if (!sc) { free(pix); goto empty; }
+            downscale(pix, sw, sh, ch, sc, dw, dh);
+            free(pix); pix = sc;
+            bt -= (sh - dh) / 2;
+        }
+        bl = (box_w - dw) / 2;
+    } else if (color || (!primary && (sw > box_w + slack || sh > box_h))) {
         float s = fminf((float)box_w / sw, (float)box_h / sh);
         if (!color && s > 1.0f) s = 1.0f;
         dw = (int)(sw * s + 0.5f); dh = (int)(sh * s + 0.5f);
