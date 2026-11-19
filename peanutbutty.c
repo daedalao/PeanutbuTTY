@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <errno.h>
@@ -41,11 +42,15 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_BITMAP_H
 #include <fontconfig/fontconfig.h>
 
 /* --- GPU & Performance Constants --- */
 #define VBO_COUNT       3
 #define ATLAS_SIZE      1024
+#define CATLAS_SIZE     1024 /* colour atlas, RGBA */
+#define MAX_GLYPHS      8192
+#define MAX_FB          16   /* fallback font faces */
 #define MAX_PARAMS      16
 #define MAX_CSI         256
 #define MAX_OSC         1024
@@ -231,7 +236,10 @@ static void gl2_load(void) {
 
 #define UL_DEFAULT 0xFFFFFFFFu /* Cell.ul sentinel: underline uses the fg colour */
 
-typedef struct { uint32_t codepoint; uint32_t fg, bg, ul; uint16_t attrs; } Cell;
+/* comb: index into comb_tab (0 = none) holding zero-width marks attached to
+ * this cell (combining accents, ZWJ, variation selectors). It sits in what
+ * was struct padding, so Cell stays 20 bytes. */
+typedef struct { uint32_t codepoint; uint32_t fg, bg, ul; uint16_t attrs; uint16_t comb; } Cell;
 typedef struct { Cell *cells; int cols; int dirty; int wrapped; int prompt; } Line;
 typedef struct { Line *lines; int head, count, cap; } ScrollBuf;
 typedef struct { float x, y, u, v; uint32_t color; uint32_t pad[3]; } Vertex;
@@ -254,7 +262,8 @@ typedef struct Terminal {
     uint32_t param_sub; /* bitmask: params[i] was introduced by ':' (SGR subparameter) */
     char csi_inter, csi_final; char osc_buf[MAX_OSC]; int osc_len;
     char csi_priv; /* private-mode marker byte (0x3C-0x3F: '<' '=' '>' '?'), kept apart from intermediates */
-    uint32_t utf8_codepoint; int utf8_remaining;
+    uint32_t utf8_codepoint, utf8_min; int utf8_remaining;
+    int last_cx, last_cy; /* cell the last printable char went into: zero-width marks attach there */
     int sel_x1, sel_y1, sel_x2, sel_y2; int sel_active;
     char title[TITLE_MAX]; int full_dirty, dirty, synchronized_update;
     uint32_t last_char;
@@ -281,6 +290,7 @@ typedef struct Terminal {
 static struct {
     Display *dpy; Window win; int screen; GLXContext ctx; GLXWindow glx_win;
     int win_w, win_h; GLuint prog; GLint u_proj, u_tex, u_win_h, u_win_w, a_pos, a_uv, a_color;
+    GLuint cprog; GLint cu_proj, cu_tex, ca_pos, ca_uv, ca_color; /* colour-glyph (emoji) program */
     Terminal *term; int pty_fd; pid_t child_pid; int cursor_phase, running;
     Cursor ptr_hand, ptr_text;
     char *sel_text;            /* owned selection contents served to requestors */
@@ -308,12 +318,16 @@ struct {
     GLuint vbo[VBO_COUNT]; Vertex *vbo_cpu[VBO_COUNT]; int current_vbo;
     int max_vertices; GLuint atlas_tex; FT_Library ft_lib; FT_Face ft_face;
     FT_Face style_faces[4];              /* [style]: 0 regular, 1 bold, 2 italic, 3 bold-italic (NULL = synthesise) */
-    FT_Face fb_faces[4]; int fb_count;   /* fallback faces for glyphs the main font lacks */
+    FT_Face fb_faces[MAX_FB]; int fb_count; /* fallback faces for glyphs the main font lacks */
     FcConfig *fc;                        /* kept alive for lazy fallback lookup */
     int font_sz, font_w, font_h, font_as;
-    struct { int u, v, w, h, bl, bt; uint32_t key; } glyphs[4096];
+    struct { int16_t u, v, w, h, bl, bt; uint32_t key; uint8_t color; } glyphs[MAX_GLYPHS];
     int glyph_count; int atlas_x, atlas_y, atlas_h;
     uint8_t *atlas_cpu; /* CPU shadow of atlas texture for fast re-upload after context loss */
+    /* RGBA atlas for colour glyphs (emoji). Created lazily on the first
+     * colour glyph, so terminals that never show one pay nothing. */
+    GLuint catlas_tex; uint8_t *catlas_cpu; int catlas_x, catlas_y, catlas_h;
+    int atlas_full;   /* an atlas or the glyph table ran out this frame: flush + redraw */
 } G_hw;
 
 /* --- Shaders --- */
@@ -337,6 +351,17 @@ static const char *FRAG_SRC =
     "    float luma = dot(c.rgb, vec3(0.299, 0.587, 0.114));\n"
     "    c.rgb = mix(vec3(luma), c.rgb, 1.4);\n"
     "    gl_FragColor = c;\n"
+    "}\n";
+
+/* Colour glyphs: the RGBA atlas holds premultiplied texels; v_color.a carries
+ * dim/blink alpha (in all four channels). Same vertex shader as above. */
+static const char *CFRAG_SRC =
+    "#version 110\n"
+    "uniform sampler2D u_tex;\n"
+    "varying vec2 v_uv;\n"
+    "varying vec4 v_color;\n"
+    "void main() {\n"
+    "    gl_FragColor = texture2D(u_tex, v_uv) * v_color;\n"
     "}\n";
 
 /* --- Core Logic --- */
@@ -383,43 +408,84 @@ static inline uint32_t pack_color(uint32_t c, uint8_t a) {
     return rgba_bytes(r, g, b, a);
 }
 
+/* Size a face for the grid. Bitmap-only faces (Noto Color Emoji's CBDT
+ * strikes, PCF) can't take FT_Set_Pixel_Sizes: pick the nearest strike and
+ * let get_glyph scale the bitmap into the cell. */
+static void face_set_size(FT_Face f, int sz) {
+    if (FT_IS_SCALABLE(f)) { FT_Set_Pixel_Sizes(f, 0, sz); return; }
+    if (f->num_fixed_sizes <= 0) return;
+    int best = 0, bd = INT_MAX;
+    for (int i = 0; i < f->num_fixed_sizes; i++) {
+        int h = f->available_sizes[i].y_ppem ? (int)(f->available_sizes[i].y_ppem >> 6) : f->available_sizes[i].height;
+        int d = h >= sz ? h - sz : (sz - h) * 4; /* prefer downscaling over upscaling */
+        if (d < bd) { bd = d; best = i; }
+    }
+    FT_Select_Size(f, best);
+}
+
+static int is_emoji_range(uint32_t cp) {
+    return (cp >= 0x1F000 && cp <= 0x1FAFF);
+}
+
 /* Face that can actually draw cp in the requested style (0 reg, 1 bold,
  * 2 italic, 3 bold-italic): the styled face, the main face, a cached fallback,
- * or a new fallback resolved through fontconfig's coverage query. */
+ * or a new fallback resolved through fontconfig. Only faces that really cover
+ * cp are cached, so misses can't fill the slots with useless fonts. */
 static FT_Face face_for(uint32_t cp, int style) {
     if (style && G_hw.style_faces[style] && FT_Get_Char_Index(G_hw.style_faces[style], cp))
         return G_hw.style_faces[style];
     if (FT_Get_Char_Index(G_hw.ft_face, cp)) return G_hw.ft_face;
     for (int i = 0; i < G_hw.fb_count; i++)
         if (FT_Get_Char_Index(G_hw.fb_faces[i], cp)) return G_hw.fb_faces[i];
-    if (G_hw.fb_count < 4 && G_hw.fc) {
-        FcPattern *pat = FcPatternCreate();
-        FcCharSet *cs = FcCharSetCreate(); FcCharSetAddChar(cs, cp);
-        FcPatternAddCharSet(pat, FC_CHARSET, cs);
-        FcPatternAddBool(pat, FC_SCALABLE, FcTrue);
-        FcPatternAddInteger(pat, FC_SPACING, FC_MONO);
+    if (G_hw.fb_count >= MAX_FB || !G_hw.fc) return G_hw.ft_face;
+
+    /* The fallback order is sorted once (per emoji/text class) and cached
+     * with the union of its coverage. Per-codepoint fontconfig sorts cost
+     * ~100ms each on a G4 with a few thousand fonts, which stalls the whole
+     * screen when many characters are missing. Codepoints no installed font
+     * has are rejected by a single union lookup. */
+    static FcFontSet *fb_set[2]; static FcCharSet *fb_union[2]; static int fb_built[2];
+    int e = is_emoji_range(cp);
+    if (!fb_built[e]) {
+        fb_built[e] = 1;
+        /* Start from the configured family so the user's fontconfig fallback
+         * order applies. No FC_SPACING=mono: monospace fonts are the ones
+         * least likely to have CJK, symbols or emoji. Trimming drops fonts
+         * that add no coverage over the ones before them. */
+        FcPattern *pat = FcNameParse((const FcChar8*)CFG.font);
+        if (!pat) pat = FcPatternCreate();
+#ifdef FC_COLOR
+        if (e) FcPatternAddBool(pat, FC_COLOR, FcTrue);
+#endif
         FcConfigSubstitute(G_hw.fc, pat, FcMatchPattern);
         FcDefaultSubstitute(pat);
         FcResult fres;
-        FcPattern *match = FcFontMatch(G_hw.fc, pat, &fres);
-        FT_Face nf = NULL;
-        if (match) {
-            FcChar8 *file = NULL;
-            if (FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch)
-                if (FT_New_Face(G_hw.ft_lib, (const char*)file, 0, &nf)) nf = NULL;
-            FcPatternDestroy(match);
-        }
-        FcPatternDestroy(pat); FcCharSetDestroy(cs);
-        if (nf) {
-            FT_Set_Pixel_Sizes(nf, 0, G_hw.font_sz);
-            G_hw.fb_faces[G_hw.fb_count++] = nf;
-            if (FT_Get_Char_Index(nf, cp)) return nf;
-        }
+        fb_set[e] = FcFontSort(G_hw.fc, pat, FcTrue, &fb_union[e], &fres);
+        FcPatternDestroy(pat);
     }
-    return G_hw.ft_face; /* give up: render .notdef */
+    FcFontSet *fs = fb_set[e];
+    if (!fs || !fb_union[e] || !FcCharSetHasChar(fb_union[e], cp)) return G_hw.ft_face;
+    FT_Face found = NULL;
+    for (int i = 0; fs && i < fs->nfont && !found; i++) {
+        FcCharSet *fcs = NULL;
+        if (FcPatternGetCharSet(fs->fonts[i], FC_CHARSET, 0, &fcs) != FcResultMatch || !FcCharSetHasChar(fcs, cp)) continue;
+        FcChar8 *file = NULL; int index = 0;
+        if (FcPatternGetString(fs->fonts[i], FC_FILE, 0, &file) != FcResultMatch) continue;
+        FcPatternGetInteger(fs->fonts[i], FC_INDEX, 0, &index); /* .ttc collections (Noto CJK) */
+        FT_Face nf = NULL;
+        if (FT_New_Face(G_hw.ft_lib, (const char*)file, index, &nf)) continue;
+        face_set_size(nf, G_hw.font_sz);
+        if (FT_Get_Char_Index(nf, cp)) found = nf; else FT_Done_Face(nf);
+    }
+    if (!found) return G_hw.ft_face; /* nothing has it: render .notdef */
+    G_hw.fb_faces[G_hw.fb_count++] = found;
+    return found;
 }
 
-static int glyph_cache[8192];
+/* Open-addressed glyph lookup: key -> index into G_hw.glyphs, -1 = empty.
+ * Twice the glyph capacity keeps probe chains short. */
+#define GCACHE_SIZE (MAX_GLYPHS * 2)
+static int glyph_cache[GCACHE_SIZE];
 static int glyph_cache_valid = 0;
 
 static void glyph_cache_reset(void) {
@@ -427,37 +493,200 @@ static void glyph_cache_reset(void) {
     glyph_cache_valid = 1;
     G_hw.glyph_count = 0;
     G_hw.atlas_x = 18; G_hw.atlas_y = 0; G_hw.atlas_h = 0;
+    G_hw.catlas_x = 0; G_hw.catlas_y = 0; G_hw.catlas_h = 0;
 }
 
-/* style: bit0 bold, bit1 italic — part of the atlas key */
+/* Drop every cached glyph and blank both atlases (font size change, or an
+ * atlas filled up). Keeps the 16x16 white patch rectangles sample from. */
+static void atlas_clear(void) {
+    memset(G_hw.atlas_cpu, 0, ATLAS_SIZE * ATLAS_SIZE);
+    for (int y = 0; y < 16; y++) memset(G_hw.atlas_cpu + y * ATLAS_SIZE, 255, 16);
+    glyph_cache_reset();
+    glBindTexture(GL_TEXTURE_2D, G_hw.atlas_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_INTENSITY8, ATLAS_SIZE, ATLAS_SIZE, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, G_hw.atlas_cpu);
+    if (G_hw.catlas_cpu) {
+        memset(G_hw.catlas_cpu, 0, CATLAS_SIZE * CATLAS_SIZE * 4);
+        glBindTexture(GL_TEXTURE_2D, G_hw.catlas_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CATLAS_SIZE, CATLAS_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, G_hw.catlas_cpu);
+    }
+    G_hw.atlas_full = 0;
+}
+
+static void catlas_upload_full(void) {
+    glGenTextures(1, &G_hw.catlas_tex); glBindTexture(GL_TEXTURE_2D, G_hw.catlas_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, CATLAS_SIZE, CATLAS_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, G_hw.catlas_cpu);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+}
+
+/* Area-average downscale of an 8-bit, ch-channel image (ch = 1 or 4). */
+static void downscale(const uint8_t *src, int sw, int sh, int ch, uint8_t *dst, int dw, int dh) {
+    for (int y = 0; y < dh; y++) {
+        int y0 = y * sh / dh, y1 = (y + 1) * sh / dh; if (y1 <= y0) y1 = y0 + 1;
+        for (int x = 0; x < dw; x++) {
+            int x0 = x * sw / dw, x1 = (x + 1) * sw / dw; if (x1 <= x0) x1 = x0 + 1;
+            uint32_t acc[4] = {0, 0, 0, 0}, n = (uint32_t)((y1 - y0) * (x1 - x0));
+            for (int yy = y0; yy < y1; yy++)
+                for (int xx = x0; xx < x1; xx++)
+                    for (int c = 0; c < ch; c++) acc[c] += src[(yy * sw + xx) * ch + c];
+            for (int c = 0; c < ch; c++) dst[(y * dw + x) * ch + c] = (uint8_t)(acc[c] / n);
+        }
+    }
+}
+
+/* Is this a zero-width format character that should never be drawn? */
+static int cp_invisible(uint32_t cp) {
+    return (cp >= 0x200B && cp <= 0x200F) || (cp >= 0x2060 && cp <= 0x2064) || cp == 0xFEFF ||
+           (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xE0100 && cp <= 0xE01EF) || (cp >= 0xE0000 && cp <= 0xE007F) ||
+           cp == 0x034F || cp == 0x00AD;
+}
+
+/* Rasterise cp into the right atlas. Returns a glyph id, or -1 when the
+ * atlas/table is full (G_hw.atlas_full is set; the next frame flushes).
+ * Glyphs that fail to load are cached as empty, so they aren't retried
+ * every frame. style: bit0 bold, bit1 italic — part of the key. */
 static int get_glyph(uint32_t cp, int style) {
-    if (!G_hw.ft_face) return 0;
+    if (!G_hw.ft_face) return -1;
     if (!glyph_cache_valid) glyph_cache_reset();
     if (!G_hw.style_faces[style]) style = 0; /* no real styled face: base glyph, synthesised at draw time */
     uint32_t key = cp | ((uint32_t)style << 22);
-    int h = key % 8192;
-    if (glyph_cache[h] != -1 && G_hw.glyphs[glyph_cache[h]].key == key) return glyph_cache[h];
-    for (int i = 0; i < G_hw.glyph_count; i++) if (G_hw.glyphs[i].key == key) return (glyph_cache[h] = i);
-    if (G_hw.glyph_count >= (int)(sizeof(G_hw.glyphs)/sizeof(G_hw.glyphs[0]))) return 0;
-    FT_Face face = face_for(cp, style);
-    if (FT_Load_Char(face, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT)) return 0;
-    FT_Bitmap *bm = &face->glyph->bitmap;
-    if (G_hw.atlas_x + (int)bm->width + 1 >= ATLAS_SIZE) { G_hw.atlas_x = 0; G_hw.atlas_y += G_hw.atlas_h + 1; G_hw.atlas_h = 0; }
-    if (G_hw.atlas_y + (int)bm->rows + 1 >= ATLAS_SIZE) return 0;
-    int id = G_hw.glyph_count++;
-    G_hw.glyphs[id].u = G_hw.atlas_x; G_hw.glyphs[id].v = G_hw.atlas_y; G_hw.glyphs[id].w = bm->width; G_hw.glyphs[id].h = bm->rows;
-    G_hw.glyphs[id].bl = face->glyph->bitmap_left; G_hw.glyphs[id].bt = face->glyph->bitmap_top; G_hw.glyphs[id].key = key;
-    /* Write into CPU shadow so we can re-upload in one shot after context loss */
-    if (G_hw.atlas_cpu) {
-        for (unsigned int row = 0; row < bm->rows; row++)
-            memcpy(G_hw.atlas_cpu + (G_hw.atlas_y + row) * ATLAS_SIZE + G_hw.atlas_x,
-                   bm->buffer + row * bm->pitch, bm->width);
+    uint32_t h = (key * 2654435761u) % GCACHE_SIZE;
+    while (glyph_cache[h] != -1) {
+        if (G_hw.glyphs[glyph_cache[h]].key == key) return glyph_cache[h];
+        h = (h + 1) % GCACHE_SIZE;
     }
-    glBindTexture(GL_TEXTURE_2D, G_hw.atlas_tex); glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, G_hw.atlas_x, G_hw.atlas_y, bm->width, bm->rows, GL_LUMINANCE, GL_UNSIGNED_BYTE, bm->buffer);
+    if (G_hw.glyph_count >= MAX_GLYPHS) { G_hw.atlas_full = 1; return -1; }
 
-    G_hw.atlas_x += (int)bm->width + 1; if ((int)bm->rows > G_hw.atlas_h) G_hw.atlas_h = bm->rows;
-    return (glyph_cache[h] = id);
+    int id = G_hw.glyph_count;
+    memset(&G_hw.glyphs[id], 0, sizeof(G_hw.glyphs[id]));
+    G_hw.glyphs[id].key = key;
+
+    FT_Face face = face_for(cp, style);
+    int primary = (face == G_hw.ft_face || face == G_hw.style_faces[style]);
+    int cells = (wcwidth(cp) == 2) ? 2 : 1;
+    int box_w = cells * G_hw.font_w, box_h = G_hw.font_h;
+    FT_Int32 flags = FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT;
+#ifdef FT_LOAD_COLOR
+    if (FT_HAS_COLOR(face)) flags |= FT_LOAD_COLOR;
+#endif
+    if (cp_invisible(cp) || FT_Load_Char(face, cp, flags)) goto empty;
+
+    /* Fallback glyphs may overhang the cell by a quarter cell (centred);
+     * anything bigger is shrunk to fit rather than spill into neighbours. */
+    int slack = G_hw.font_w / 4;
+    int bt0 = face->glyph->bitmap_top, bh0 = (int)face->glyph->bitmap.rows; /* for re-centring */
+    if (!primary && FT_IS_SCALABLE(face) && face->glyph->bitmap.pixel_mode != FT_PIXEL_MODE_BGRA) {
+        int bw = (int)face->glyph->bitmap.width, bh = (int)face->glyph->bitmap.rows;
+        if (bw > box_w + slack || bh > box_h) {
+            float s = fminf((float)box_w / (bw ? bw : 1), (float)box_h / (bh ? bh : 1));
+            int nsz = (int)(G_hw.font_sz * s); if (nsz < 4) nsz = 4;
+            FT_Set_Pixel_Sizes(face, 0, nsz);
+            int err = FT_Load_Char(face, cp, flags);
+            FT_Set_Pixel_Sizes(face, 0, G_hw.font_sz);
+            if (err) goto empty;
+        }
+    }
+
+    FT_Bitmap *bm = &face->glyph->bitmap;
+    int color = (bm->pixel_mode == FT_PIXEL_MODE_BGRA);
+    int ch = color ? 4 : 1;
+    int sw = (int)bm->width, sh = (int)bm->rows;
+    int bl = face->glyph->bitmap_left, bt = face->glyph->bitmap_top;
+    if (sw <= 0 || sh <= 0) goto empty;
+
+    /* Normalise to tightly packed 8-bit gray or RGBA, honouring pitch.
+     * 1-bit (embedded CJK bitmaps, PCF), 2- and 4-bit go through
+     * FT_Bitmap_Convert and are stretched to 0..255. */
+    uint8_t *pix = malloc((size_t)sw * sh * ch);
+    if (!pix) goto empty;
+    if (color) {
+        for (int y = 0; y < sh; y++) {
+            const uint8_t *row = bm->buffer + (bm->pitch >= 0 ? y : sh - 1 - y) * abs(bm->pitch);
+            for (int x = 0; x < sw; x++) { /* premultiplied BGRA -> premultiplied RGBA */
+                pix[(y*sw + x)*4 + 0] = row[x*4 + 2];
+                pix[(y*sw + x)*4 + 1] = row[x*4 + 1];
+                pix[(y*sw + x)*4 + 2] = row[x*4 + 0];
+                pix[(y*sw + x)*4 + 3] = row[x*4 + 3];
+            }
+        }
+    } else if (bm->pixel_mode == FT_PIXEL_MODE_GRAY) {
+        for (int y = 0; y < sh; y++)
+            memcpy(pix + y*sw, bm->buffer + (bm->pitch >= 0 ? y : sh - 1 - y) * abs(bm->pitch), sw);
+    } else {
+        FT_Bitmap conv; FT_Bitmap_Init(&conv);
+        if (FT_Bitmap_Convert(G_hw.ft_lib, bm, &conv, 1) || (int)conv.width != sw || (int)conv.rows != sh) {
+            FT_Bitmap_Done(G_hw.ft_lib, &conv); free(pix); goto empty;
+        }
+        int maxv = conv.num_grays > 1 ? conv.num_grays - 1 : 1;
+        for (int y = 0; y < sh; y++) {
+            const uint8_t *row = conv.buffer + (conv.pitch >= 0 ? y : sh - 1 - y) * abs(conv.pitch);
+            for (int x = 0; x < sw; x++) pix[y*sw + x] = (uint8_t)(row[x] * 255 / maxv);
+        }
+        FT_Bitmap_Done(G_hw.ft_lib, &conv);
+    }
+
+    /* Fit into the cell box. Colour glyphs (emoji strikes are ~109px) are
+     * always scaled to the box and centred; oversized fallback bitmaps
+     * (non-scalable fonts) are scaled down. Scaled glyphs keep their
+     * baseline proportion and are clamped inside the line. */
+    int dw = sw, dh = sh;
+    if (color || (!primary && (sw > box_w + slack || sh > box_h))) {
+        float s = fminf((float)box_w / sw, (float)box_h / sh);
+        if (!color && s > 1.0f) s = 1.0f;
+        dw = (int)(sw * s + 0.5f); dh = (int)(sh * s + 0.5f);
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        if (dw != sw || dh != sh) {
+            uint8_t *sc = malloc((size_t)dw * dh * ch);
+            if (!sc) { free(pix); goto empty; }
+            downscale(pix, sw, sh, ch, sc, dw, dh);
+            free(pix); pix = sc;
+        }
+        bl = (box_w - dw) / 2;
+        if (color) bt = G_hw.font_as - (box_h - dh) / 2;
+        else bt -= (sh - dh) / 2; /* shrink about the glyph's vertical centre */
+    }
+    if (!primary && !color) {
+        /* Shrunk outlines: restore the original vertical centre (FreeType
+         * scaled them about the baseline). Then centre horizontally if the
+         * ink leaves the cell, and keep it inside the line. */
+        if (bh0 != sh && bt == face->glyph->bitmap_top) bt = bt0 - (bh0 - dh) / 2;
+        if (bl < 0 || bl + dw > box_w) bl = (box_w - dw) / 2;
+        if (bt > G_hw.font_as) bt = G_hw.font_as;
+        if (G_hw.font_as - bt + dh > box_h) bt = G_hw.font_as - (box_h - dh);
+    }
+
+    /* Pack into the atlas (shelf packing). */
+    int ax, ay, asz = color ? CATLAS_SIZE : ATLAS_SIZE;
+    int *px = color ? &G_hw.catlas_x : &G_hw.atlas_x, *py = color ? &G_hw.catlas_y : &G_hw.atlas_y, *ph = color ? &G_hw.catlas_h : &G_hw.atlas_h;
+    if (*px + dw + 1 >= asz) { *px = 0; *py += *ph + 1; *ph = 0; }
+    if (*py + dh + 1 >= asz || dw + 1 >= asz) { free(pix); G_hw.atlas_full = 1; return -1; }
+    ax = *px; ay = *py;
+    if (color && !G_hw.catlas_cpu) {
+        G_hw.catlas_cpu = calloc((size_t)CATLAS_SIZE * CATLAS_SIZE, 4);
+        if (!G_hw.catlas_cpu) { free(pix); goto empty; }
+        catlas_upload_full();
+    }
+    uint8_t *shadow = color ? G_hw.catlas_cpu : G_hw.atlas_cpu;
+    if (shadow)
+        for (int y = 0; y < dh; y++)
+            memcpy(shadow + ((size_t)(ay + y) * asz + ax) * ch, pix + (size_t)y * dw * ch, (size_t)dw * ch);
+    glBindTexture(GL_TEXTURE_2D, color ? G_hw.catlas_tex : G_hw.atlas_tex); glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, ax, ay, dw, dh, color ? GL_RGBA : GL_LUMINANCE, GL_UNSIGNED_BYTE, pix);
+    glBindTexture(GL_TEXTURE_2D, G_hw.atlas_tex);
+    free(pix);
+    *px += dw + 1; if (dh > *ph) *ph = dh;
+
+    G_hw.glyphs[id].u = ax; G_hw.glyphs[id].v = ay; G_hw.glyphs[id].w = dw; G_hw.glyphs[id].h = dh;
+    G_hw.glyphs[id].bl = bl; G_hw.glyphs[id].bt = bt; G_hw.glyphs[id].color = color;
+empty:
+    G_hw.glyph_count++;
+    glyph_cache[h] = id;
+    return id;
 }
 
 static void draw_rect_hw(Vertex *vbo, float x, float y, float w, float h, uint32_t color, int *v_idx) {
@@ -469,7 +698,30 @@ static void draw_rect_hw(Vertex *vbo, float x, float y, float w, float h, uint32
     *v_idx += 4;
 }
 
+/* Colour glyphs are drawn in a second pass with their own program and the
+ * RGBA atlas, so the monochrome hot path (one texture fetch per fragment)
+ * stays exactly as cheap on the r300. */
+#define CQUAD_MAX 4096
+static Vertex cquads[CQUAD_MAX * 4];
+static int cq_idx;
+
 static void draw_glyph_hw(Vertex *vbo, int id, float x, float y, uint32_t color, int italic, int *v_idx) {
+    if (id < 0 || G_hw.glyphs[id].w == 0) return;
+    if (G_hw.glyphs[id].color) {
+        if (cq_idx >= CQUAD_MAX * 4) return;
+        float u0 = (float)G_hw.glyphs[id].u / CATLAS_SIZE, v0 = (float)G_hw.glyphs[id].v / CATLAS_SIZE;
+        float u1 = (float)(G_hw.glyphs[id].u + G_hw.glyphs[id].w) / CATLAS_SIZE;
+        float v1 = (float)(G_hw.glyphs[id].v + G_hw.glyphs[id].h) / CATLAS_SIZE;
+        float ox = floorf(x + (float)G_hw.glyphs[id].bl), oy = floorf(y + (float)(G_hw.font_as - G_hw.glyphs[id].bt));
+        float w = (float)G_hw.glyphs[id].w, h = (float)G_hw.glyphs[id].h;
+        uint8_t a = ((const uint8_t*)&color)[3]; /* memory byte 3 is alpha on either endianness */
+        uint32_t c = rgba_bytes(a, a, a, a);     /* shader: texel * v_color (premultiplied) */
+        Vertex *v = &cquads[cq_idx];
+        v[0] = (Vertex){ ox, oy, u0, v0, c, {0,0,0} }; v[1] = (Vertex){ ox+w, oy, u1, v0, c, {0,0,0} };
+        v[2] = (Vertex){ ox+w, oy+h, u1, v1, c, {0,0,0} }; v[3] = (Vertex){ ox, oy+h, u0, v1, c, {0,0,0} };
+        cq_idx += 4;
+        return;
+    }
     float u0 = (float)G_hw.glyphs[id].u / ATLAS_SIZE, v0 = (float)G_hw.glyphs[id].v / ATLAS_SIZE;
     float u1 = (float)(G_hw.glyphs[id].u + G_hw.glyphs[id].w) / ATLAS_SIZE;
     float v1 = (float)(G_hw.glyphs[id].v + G_hw.glyphs[id].h) / ATLAS_SIZE;
@@ -481,6 +733,18 @@ static void draw_glyph_hw(Vertex *vbo, int id, float x, float y, uint32_t color,
     v[0] = (Vertex){ ox+sh, oy, u0, v0, color, {0,0,0} }; v[1] = (Vertex){ ox+w+sh, oy, u1, v0, color, {0,0,0} };
     v[2] = (Vertex){ ox+w, oy+h, u1, v1, color, {0,0,0} }; v[3] = (Vertex){ ox, oy+h, u0, v1, color, {0,0,0} };
     *v_idx += 4;
+}
+
+/* Combining mark over a cell of cellpx pixels. Monospace fonts give marks
+ * a full advance with the ink over the cell, so they draw at the cell
+ * origin; zero-advance marks from proportional fallbacks hang left of the
+ * origin (negative bearing) and get centred over the cell instead. */
+static void draw_mark_hw(Vertex *vbo, int id, float x, float y, int cellpx, uint32_t color, int italic, int *v_idx) {
+    if (id < 0 || G_hw.glyphs[id].w == 0) return;
+    int bl = G_hw.glyphs[id].bl, w = G_hw.glyphs[id].w;
+    float dx = 0;
+    if (bl < 0 || bl + w > cellpx) dx = (float)((cellpx - w) / 2 - bl);
+    draw_glyph_hw(vbo, id, x + dx, y, color, italic, v_idx);
 }
 
 /* --- Procedural box drawing ---------------------------------------------
@@ -680,7 +944,7 @@ static void sb_push(Terminal *t, Line *src) {
 }
 
 static void term_clear_line(Terminal *t, Line *l, int from, int to) {
-    for (int i=from; i<=to && i<t->cols; i++) { l->cells[i].codepoint = ' '; l->cells[i].fg = t->fg; l->cells[i].bg = t->bg; l->cells[i].ul = UL_DEFAULT; l->cells[i].attrs = 0; }
+    for (int i=from; i<=to && i<t->cols; i++) { l->cells[i].codepoint = ' '; l->cells[i].fg = t->fg; l->cells[i].bg = t->bg; l->cells[i].ul = UL_DEFAULT; l->cells[i].attrs = 0; l->cells[i].comb = 0; }
     if (from <= 0 && to >= t->cols-1) { l->wrapped = 0; l->prompt = 0; }
 }
 
@@ -703,6 +967,40 @@ static void term_scroll_down(Terminal *t, int n) {
     }
 }
 
+/* Interned sequences of zero-width marks; Cell.comb indexes this table.
+ * Entries are deduplicated and never freed: real text uses a handful of
+ * distinct sequences, so this stays tiny. Index 0 means "no marks". */
+#define COMB_MAX 4      /* marks kept per cell */
+#define COMB_CAP 4096
+static uint32_t comb_tab[COMB_CAP][COMB_MAX];
+static int comb_n = 1;
+
+static uint16_t comb_intern(const uint32_t *seq) {
+    for (int i = 1; i < comb_n; i++)
+        if (!memcmp(comb_tab[i], seq, sizeof(comb_tab[i]))) return (uint16_t)i;
+    if (comb_n >= COMB_CAP) return 0;
+    memcpy(comb_tab[comb_n], seq, sizeof(comb_tab[comb_n]));
+    return (uint16_t)comb_n++;
+}
+
+/* Attach a zero-width character (combining accent, ZWJ, variation selector)
+ * to the cell the previous character went into, without moving the cursor. */
+static void term_combine(Terminal *t, uint32_t cp) {
+    Line *scr = t->alt_active ? t->alt_screen : t->screen;
+    int c = (t->last_cy == t->cy && t->last_cx >= t->cx - 2 && t->last_cx <= t->cx) ? t->last_cx : t->cx - 1;
+    if (c < 0 || c >= t->cols) return;
+    Cell *cell = &scr[t->cy].cells[c];
+    if (cell->codepoint == CP_WIDE_CONTINUATION && c > 0) cell--;
+    uint32_t seq[COMB_MAX] = {0};
+    int n = 0;
+    if (cell->comb) { memcpy(seq, comb_tab[cell->comb], sizeof(seq)); while (n < COMB_MAX && seq[n]) n++; }
+    if (n >= COMB_MAX) return;
+    seq[n] = cp;
+    uint16_t idx = comb_intern(seq);
+    if (idx) cell->comb = idx;
+    scr[t->cy].dirty = 1;
+}
+
 static void term_putchar(Terminal *t, uint32_t cp) {
     int active_cs = (t->charset == 0) ? t->g0_charset : t->g1_charset;
     if (active_cs == 1 && cp >= 0x5F && cp <= 0x7E) {
@@ -712,7 +1010,12 @@ static void term_putchar(Terminal *t, uint32_t cp) {
         };
         cp = vt100_map[cp - 0x5F];
     }
-    int w = wcwidth(cp); if (w < 1) w = 1;
+    int w = wcwidth(cp);
+    if (w == 0) { term_combine(t, cp); return; }  /* combining marks, ZWJ, VS16: no cell of their own */
+    if (w < 0) {
+        if (cp >= 0x80 && cp <= 0x9F) return;     /* C1 controls: not printable */
+        w = 1;                                    /* unassigned/private use: one cell */
+    }
     Line *scr = t->alt_active ? t->alt_screen : t->screen;
 
     /* VT100 deferred wrap: if pending and autowrap on, wrap now before placing char */
@@ -734,8 +1037,8 @@ static void term_putchar(Terminal *t, uint32_t cp) {
     }
 
     Cell *cell = &scr[t->cy].cells[t->cx];
-    cell->codepoint = cp; cell->attrs = t->attrs; cell->fg = t->fg; cell->bg = t->bg; cell->ul = t->ul;
-    t->last_char = cp;
+    cell->codepoint = cp; cell->attrs = t->attrs; cell->fg = t->fg; cell->bg = t->bg; cell->ul = t->ul; cell->comb = 0;
+    t->last_char = cp; t->last_cx = t->cx; t->last_cy = t->cy;
 
     if (w == 2 && t->cx < t->cols - 1) {
         scr[t->cy].cells[t->cx + 1].codepoint = CP_WIDE_CONTINUATION;
@@ -743,6 +1046,7 @@ static void term_putchar(Terminal *t, uint32_t cp) {
         scr[t->cy].cells[t->cx + 1].fg = t->fg;
         scr[t->cy].cells[t->cx + 1].bg = t->bg;
         scr[t->cy].cells[t->cx + 1].ul = t->ul;
+        scr[t->cy].cells[t->cx + 1].comb = 0;
     }
 
     t->cx += w;
@@ -1038,17 +1342,22 @@ static void term_csi(Terminal *t) {
     }
 }
 
+/* Strict UTF-8: overlong forms, surrogates, values above U+10FFFF and
+ * stray continuation bytes all decode to U+FFFD. A sequence cut short by a
+ * non-continuation byte is handled in term_process_byte. */
 static int utf8_decode(Terminal *t, uint8_t byte, uint32_t *cp) {
-    if (t->utf8_remaining > 0) {
-        if ((byte & 0xC0) == 0x80) { t->utf8_codepoint = (t->utf8_codepoint << 6) | (byte & 0x3F);
-            if (--t->utf8_remaining == 0) { *cp = t->utf8_codepoint; return 1; } return 0; }
-        t->utf8_remaining = 0;
+    if (t->utf8_remaining > 0) { /* caller guarantees byte is a continuation */
+        t->utf8_codepoint = (t->utf8_codepoint << 6) | (byte & 0x3F);
+        if (--t->utf8_remaining) return 0;
+        uint32_t c = t->utf8_codepoint;
+        *cp = (c < t->utf8_min || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) ? 0xFFFD : c;
+        return 1;
     }
     if (byte < 0x80) { *cp = byte; return 1; }
-    if ((byte & 0xE0) == 0xC0) { t->utf8_codepoint = byte & 0x1F; t->utf8_remaining = 1; return 0; }
-    if ((byte & 0xF0) == 0xE0) { t->utf8_codepoint = byte & 0x0F; t->utf8_remaining = 2; return 0; }
-    if ((byte & 0xF8) == 0xF0) { t->utf8_codepoint = byte & 0x07; t->utf8_remaining = 3; return 0; }
-    *cp = 0xFFFD; return 1;
+    if (byte >= 0xC2 && byte <= 0xDF) { t->utf8_codepoint = byte & 0x1F; t->utf8_remaining = 1; t->utf8_min = 0x80; return 0; }
+    if ((byte & 0xF0) == 0xE0) { t->utf8_codepoint = byte & 0x0F; t->utf8_remaining = 2; t->utf8_min = 0x800; return 0; }
+    if (byte >= 0xF0 && byte <= 0xF4) { t->utf8_codepoint = byte & 0x07; t->utf8_remaining = 3; t->utf8_min = 0x10000; return 0; }
+    *cp = 0xFFFD; return 1; /* 0x80-0xC1, 0xF5-0xFF */
 }
 
 /* X11 colour spec: "#RRGGBB" or "rgb:RR/GG/BB" (1-4 hex digits per channel) */
@@ -1313,8 +1622,19 @@ static void xtgettcap_reply(Terminal *t) {
     } else write(G.pty_fd, "\033P0+r\033\\", 7);
 }
 
+static void term_process_cp(Terminal *t, uint32_t cp);
+
 static void term_process_byte(Terminal *t, uint8_t byte) {
-    uint32_t cp; if (!utf8_decode(t, byte, &cp)) return;
+    uint32_t cp;
+    if (t->utf8_remaining > 0 && (byte & 0xC0) != 0x80) { /* truncated sequence */
+        t->utf8_remaining = 0;
+        term_process_cp(t, 0xFFFD);
+    }
+    if (utf8_decode(t, byte, &cp)) term_process_cp(t, cp);
+}
+
+static void term_process_cp(Terminal *t, uint32_t cp) {
+    uint8_t byte = (uint8_t)cp; /* sixel/DCS data is ASCII */
     if (t->parser_state == ST_GROUND) {
         if (cp < 0x20) {
             if (cp == 0x1B) t->parser_state = ST_ESC;
@@ -1443,7 +1763,7 @@ static void term_process(Terminal *t, const uint8_t *buf, int len) {
     if (len > 0) t->dirty = 1;
     int old_cy = t->cy;
     for (int i=0; i<len; i++) {
-        if (t->parser_state == ST_GROUND && buf[i] >= 0x20 && buf[i] < 0x7F) term_putchar(t, buf[i]);
+        if (t->parser_state == ST_GROUND && !t->utf8_remaining && buf[i] >= 0x20 && buf[i] < 0x7F) term_putchar(t, buf[i]);
         else term_process_byte(t, buf[i]);
     }
     /* Rescan affected lines for URLs */
@@ -1561,6 +1881,12 @@ static void hints_build(Terminal *t) {
 /* --- Optimized Rendering Engine --- */
 static void render_frame(void) {
     Terminal *t = G.term;
+    /* An atlas filled up last frame: start over with only what's on screen.
+     * If it fills again within this frame, accept the missing glyphs
+     * rather than thrash. */
+    int atlas_flushed = 0;
+    if (G_hw.atlas_full) { atlas_clear(); atlas_flushed = 1; }
+    cq_idx = 0;
     /* Resize is handled by ConfigureNotify in the event loop — no X11 round-trip here */
     glViewport(0, 0, G.win_w, G.win_h);
 
@@ -1616,7 +1942,7 @@ static void render_frame(void) {
         for (int c=0; c<ncols; c++) {
             Cell *cell = &ln->cells[c];
             if (cell->attrs & ATTR_BLINK) any_blink = 1;
-            if (cell->codepoint <= 32 || cell->codepoint == CP_WIDE_CONTINUATION) continue;
+            if ((cell->codepoint <= 32 && !cell->comb) || cell->codepoint == CP_WIDE_CONTINUATION) continue;
             if (cell->attrs & ATTR_INVIS) continue;
             if ((cell->attrs & ATTR_BLINK) && !G.cursor_phase) continue;
             /* ATTR_REVERSE, selection and search matches swap fg/bg: text drawn in bg
@@ -1644,6 +1970,16 @@ static void render_frame(void) {
                 if (synth_bold) draw_glyph_hw(vbo_ptr, gid, (float)(c*G_hw.font_w+1), py, fgc, synth_ital, &v_idx);
                 draw_glyph_hw(vbo_ptr, gid, (float)(c*G_hw.font_w), py, fgc, synth_ital, &v_idx);
             }
+            if (cell->comb) { /* combining marks stacked on this cell */
+                int cw = (c < ncols - 1 && ln->cells[c+1].codepoint == CP_WIDE_CONTINUATION) ? 2 : 1;
+                int style = ((cell->attrs & ATTR_BOLD) ? 1 : 0) | ((cell->attrs & ATTR_ITALIC) ? 2 : 0);
+                int synth_ital = (cell->attrs & ATTR_ITALIC) && !G_hw.style_faces[style];
+                for (int k = 0; k < COMB_MAX && comb_tab[cell->comb][k]; k++) {
+                    uint32_t m = comb_tab[cell->comb][k];
+                    if (cp_invisible(m)) continue;
+                    draw_mark_hw(vbo_ptr, get_glyph(m, style), (float)(c*G_hw.font_w), py, cw*G_hw.font_w, fgc, synth_ital, &v_idx);
+                }
+            }
             if (cell->attrs & (ATTR_UNDERLINE | ATTR_UNDERCURL | ATTR_UL_DOUBLE | ATTR_URL)) {
                 int w = (c < ncols - 1 && ln->cells[c+1].codepoint == CP_WIDE_CONTINUATION) ? 2 : 1;
                 uint32_t ulc = (cell->ul != UL_DEFAULT) ? pack_color(cell->ul, glyph_alpha) : fgc;
@@ -1668,6 +2004,7 @@ static void render_frame(void) {
         }
     }
     t->has_blink = any_blink;
+    int v_text_end = v_idx; /* colour glyphs draw here: above text/backgrounds, below cursor and overlays */
     if (t->cursor_visible && t->sb_offset == 0) {
         float cx = (float)t->cx * G_hw.font_w, cy = (float)t->cy * G_hw.font_h;
         float fw = (float)G_hw.font_w, fh = (float)G_hw.font_h;
@@ -1717,6 +2054,11 @@ static void render_frame(void) {
         }
     }
 
+    /* Glyphs went missing because an atlas filled: flush and rebuild this
+     * frame instead of presenting it with holes (once; see top). */
+    if (G_hw.atlas_full && !atlas_flushed) { render_frame(); return; }
+    G_hw.atlas_full = 0;
+
     glBindTexture(GL_TEXTURE_2D, G_hw.atlas_tex);
     glBindBuffer(GL_ARRAY_BUFFER, G_hw.vbo[G_hw.current_vbo]);
     glBufferSubData(GL_ARRAY_BUFFER, 0, v_idx * sizeof(Vertex), vbo_ptr);
@@ -1724,7 +2066,28 @@ static void render_frame(void) {
     glVertexAttribPointer(G.a_pos, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
     glVertexAttribPointer(G.a_uv, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)8);
     glVertexAttribPointer(G.a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), (void*)16);
-    glDrawArrays(GL_QUADS, 0, v_idx);
+    if (cq_idx > 0 && G.cprog && G_hw.catlas_tex && v_idx + cq_idx <= G_hw.max_vertices) {
+        glDrawArrays(GL_QUADS, 0, v_text_end);
+        /* colour pass: same buffer, appended after the mono vertices */
+        glBufferSubData(GL_ARRAY_BUFFER, v_idx * sizeof(Vertex), cq_idx * sizeof(Vertex), cquads);
+        glUseProgram(G.cprog); glUniformMatrix4fv(G.cu_proj, 1, GL_FALSE, g_proj); glUniform1i(G.cu_tex, 0);
+        glBindTexture(GL_TEXTURE_2D, G_hw.catlas_tex);
+        glEnableVertexAttribArray(G.ca_pos); glEnableVertexAttribArray(G.ca_uv); glEnableVertexAttribArray(G.ca_color);
+        glVertexAttribPointer(G.ca_pos, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
+        glVertexAttribPointer(G.ca_uv, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)8);
+        glVertexAttribPointer(G.ca_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), (void*)16);
+        glDrawArrays(GL_QUADS, v_idx, cq_idx);
+        /* back to the mono program for overlays (cursor, bell, search, hints) */
+        glUseProgram(G.prog);
+        glBindTexture(GL_TEXTURE_2D, G_hw.atlas_tex);
+        glVertexAttribPointer(G.a_pos, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
+        glVertexAttribPointer(G.a_uv, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)8);
+        glVertexAttribPointer(G.a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), (void*)16);
+        if (v_idx > v_text_end) glDrawArrays(GL_QUADS, v_text_end, v_idx - v_text_end);
+        v_idx += cq_idx; /* sixel quads go after the colour quads */
+    } else {
+        glDrawArrays(GL_QUADS, 0, v_idx);
+    }
 
     int nsix = t->sixel_count < 64 ? t->sixel_count : 64;
     for (int i=0; i<nsix && t->sb_offset == 0; i++) {
@@ -1737,6 +2100,21 @@ static void render_frame(void) {
         }
     }
     glXSwapBuffers(G.dpy, G.win);
+}
+
+/* Build the colour-glyph program. Failure isn't fatal: emoji just won't
+ * draw (the mono program and everything else are unaffected). */
+static void build_color_prog(void) {
+    GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(v, 1, &VERT_SRC, NULL); glCompileShader(v);
+    glShaderSource(f, 1, &CFRAG_SRC, NULL); glCompileShader(f);
+    GLuint p = glCreateProgram(); glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p);
+    glDeleteShader(v); glDeleteShader(f);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { char log[512]; glGetProgramInfoLog(p, 512, NULL, log); fprintf(stderr, "peanutbutty: colour glyph shader: %s\n", log); G.cprog = 0; return; }
+    G.cprog = p;
+    G.cu_proj = glGetUniformLocation(p, "u_proj"); G.cu_tex = glGetUniformLocation(p, "u_tex");
+    G.ca_pos = glGetAttribLocation(p, "a_pos"); G.ca_uv = glGetAttribLocation(p, "a_uv"); G.ca_color = glGetAttribLocation(p, "a_color");
 }
 
 /* Recreate all GL objects (shaders, VBOs, atlas texture) from CPU state after
@@ -1756,6 +2134,7 @@ static void gl_recreate_resources(void) {
     G.a_pos   = glGetAttribLocation(G.prog, "a_pos");
     G.a_uv    = glGetAttribLocation(G.prog, "a_uv");
     G.a_color = glGetAttribLocation(G.prog, "a_color");
+    build_color_prog();
 
     /* Atlas texture — single upload from CPU shadow */
     glGenTextures(1, &G_hw.atlas_tex); glBindTexture(GL_TEXTURE_2D, G_hw.atlas_tex);
@@ -1763,6 +2142,7 @@ static void gl_recreate_resources(void) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_INTENSITY8, ATLAS_SIZE, ATLAS_SIZE, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, G_hw.atlas_cpu);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    if (G_hw.catlas_cpu) catlas_upload_full(); /* colour atlas, if any emoji were drawn */
 
     /* VBOs */
     glGenBuffers(VBO_COUNT, G_hw.vbo);
@@ -1780,7 +2160,7 @@ static void gl_recreate_resources(void) {
 static void font_set_metrics(int sz) {
     G_hw.font_sz = sz;
     for (int s = 0; s < 4; s++) if (G_hw.style_faces[s]) FT_Set_Pixel_Sizes(G_hw.style_faces[s], 0, sz);
-    for (int i = 0; i < G_hw.fb_count; i++) FT_Set_Pixel_Sizes(G_hw.fb_faces[i], 0, sz);
+    for (int i = 0; i < G_hw.fb_count; i++) face_set_size(G_hw.fb_faces[i], sz);
     G_hw.font_h = G_hw.ft_face->size->metrics.height >> 6;
     G_hw.font_as = G_hw.ft_face->size->metrics.ascender >> 6;
     G_hw.font_w = G_hw.ft_face->size->metrics.max_advance >> 6;
@@ -1808,12 +2188,7 @@ static void font_resize(int newsz) {
     if (newsz > 48) newsz = 48;
     if (newsz == G_hw.font_sz) return;
     font_set_metrics(newsz);
-    memset(G_hw.atlas_cpu, 0, ATLAS_SIZE * ATLAS_SIZE);
-    for (int y = 0; y < 16; y++) memset(G_hw.atlas_cpu + y * ATLAS_SIZE, 255, 16);
-    glyph_cache_reset();
-    glBindTexture(GL_TEXTURE_2D, G_hw.atlas_tex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_INTENSITY8, ATLAS_SIZE, ATLAS_SIZE, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, G_hw.atlas_cpu);
+    atlas_clear();
     int cols = (G.win_w - 2*CFG.padding) / G_hw.font_w;
     int rows = (G.win_h - 2*CFG.padding) / G_hw.font_h;
     if (cols < 2) cols = 2;
@@ -2084,7 +2459,7 @@ static char *extract_selection(Terminal *t) {
     int y1 = fmin(t->sel_y1, t->sel_y2), y2 = fmax(t->sel_y1, t->sel_y2);
     int x1 = (t->sel_y1 < t->sel_y2) ? t->sel_x1 : ((t->sel_y1 > t->sel_y2) ? t->sel_x2 : fmin(t->sel_x1, t->sel_x2));
     int x2 = (t->sel_y1 < t->sel_y2) ? t->sel_x2 : ((t->sel_y1 > t->sel_y2) ? t->sel_x1 : fmax(t->sel_x1, t->sel_x2));
-    char *buf = malloc((size_t)(y2 - y1 + 1) * (t->cols + 2) * 4), *p = buf;
+    char *buf = malloc((size_t)(y2 - y1 + 1) * (t->cols * (1 + COMB_MAX) + 2) * 4), *p = buf;
     for (int r = y1; r <= y2; r++) {
         Line *ln = visible_line(t, r);
         int c1 = (r == y1) ? x1 : 0, c2 = (r == y2) ? x2 : t->cols - 1;
@@ -2095,6 +2470,8 @@ static char *extract_selection(Terminal *t) {
             if (cp == CP_WIDE_CONTINUATION) continue;
             if (cp < ' ') cp = ' ';
             utf8_encode(&p, cp);
+            for (int k = 0; ln->cells[c].comb && k < COMB_MAX && comb_tab[ln->cells[c].comb][k]; k++)
+                utf8_encode(&p, comb_tab[ln->cells[c].comb][k]);
         }
         while (p > line_start && p[-1] == ' ') p--; /* trim trailing blanks */
         if (r < y2) *p++ = '\n';
@@ -2150,6 +2527,12 @@ static void mouse_report(int btn, int px, int py, int type, unsigned state) {
 
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
+    /* wcwidth() follows LC_CTYPE: under LANG=C/POSIX every non-ASCII char is
+     * "unprintable", which breaks wide/zero-width handling. The terminal
+     * always speaks UTF-8, so make sure our own ctype does too. (The child's
+     * environment is left alone.) */
+    if (wcwidth(0x4E00) != 2 && !setlocale(LC_CTYPE, "C.UTF-8") && !setlocale(LC_CTYPE, "C.utf8"))
+        setlocale(LC_CTYPE, "en_US.UTF-8");
     config_load();
     palette_init();
     G.win_w = 1024; G.win_h = 768; G.focused = 1;
@@ -2252,6 +2635,7 @@ int main(int argc, char **argv) {
     G.u_win_h = glGetUniformLocation(G.prog, "u_win_h"); G.u_win_w = glGetUniformLocation(G.prog, "u_win_w");
     G.a_pos = glGetAttribLocation(G.prog, "a_pos");
     G.a_uv = glGetAttribLocation(G.prog, "a_uv"); G.a_color = glGetAttribLocation(G.prog, "a_color");
+    build_color_prog();
     G.term = term_new(cols, rows);
     
     struct winsize ws = { (unsigned short)rows, (unsigned short)cols, 0, 0 };

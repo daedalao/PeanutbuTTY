@@ -14,7 +14,15 @@ Inspired by Alacritty's clean aesthetic.
   invisible, reverse; `:`-subparameter colour forms (38:2::R:G:B)
 - 256-colour palette + 24-bit truecolor; dynamic colours via OSC 4/10/11/12
   (set + query + reset)
-- UTF-8, wide (CJK) characters, fontconfig font fallback for missing glyphs
+- UTF-8 (strict: overlong/surrogate/truncated sequences show U+FFFD), wide
+  (CJK) characters, combining marks / ZWJ / variation selectors attached to
+  the preceding cell (stays in sync with the shell's `wcwidth`)
+- fontconfig fallback: per-codepoint coverage search (up to 16 faces, .ttc
+  aware), oversized fallback glyphs scaled into the cell, 1-bit embedded
+  bitmaps handled
+- **Colour emoji** (Noto Color Emoji CBDT, COLR fonts) via a lazily created
+  RGBA atlas and a second tiny GLSL 1.10 program, so the mono text path keeps
+  a single texture fetch per fragment; atlases flush and rebuild when full
 - **Procedural box drawing**: U+2500-257F box/line characters (light,
   heavy, double, dashed), U+2580-259F block elements/shades/quadrants and
   powerline triangles (U+E0B0/E0B2) are drawn as exact-cell-geometry quads
